@@ -13,6 +13,8 @@
 | `Dockerfile.homelab` | 用本地源码构建（上游 Dockerfile 是下载发布包）；`TELEMETRY=0`；可选 `APK_MIRROR` / `PIP_INDEX_URL` |
 | `tests/test_homelab.py` | 插件测试，单独运行，不改上游的 `tests/run_all.py` |
 
+容器更新的 Telegram 通知：`telegram()` 遇到断连、超时、429/5xx 会再试两次；「正在更新」「已更新」「已清理」和各项「未完成」汇总这类只告知结果的消息走 `tell()`，发不出去只记日志，不改变更新或清理的状态。2026-10-22 rsshub 的自动更新其实成功了，只是那条通知赶上连接断开，被标成 failed、报了「更新未完成」，回退容器也不会被清理；这类记录（failed 但带 `applied` / `new_id`）的回退容器现在照常在 2 天后清理。
+
 ## 更新流程
 
 1. **CI**（`.github/workflows/homelab.yml`）：每次推送 `homelab` 跑上游的全部测试和插件测试、试构建镜像，通过后打 `homelab-v<上游版本>-h<提交数>` 标签。每天 01:17 UTC 先尝试合并上游最新的正式版本；合并冲突或测试不过就开一个 `upstream-sync` issue，不推送。

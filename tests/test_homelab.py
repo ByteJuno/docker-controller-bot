@@ -126,6 +126,83 @@ def test_self_update_keeps_the_newest_images():
 	assert sorted(removed) == ["5.0.0-homelab.1", "v5.0.0-h6"], removed
 
 
+def dropped_connection(*args, **kwargs):
+	import requests
+	raise requests.ConnectionError("Remote end closed connection without response")
+
+
+def test_telegram_retries_a_dropped_connection():
+	from homelab import docker_updates
+
+	class Reply:
+		ok, status_code = True, 200
+
+		def json(self):
+			return {"ok": True, "result": {"message_id": 7}}
+
+	sent = []
+
+	def post(url, json=None, timeout=None):
+		sent.append(json["text"])
+		if len(sent) == 1:
+			dropped_connection()
+		return Reply()
+
+	original = docker_updates.requests.post, docker_updates.time.sleep
+	docker_updates.requests.post, docker_updates.time.sleep = post, lambda seconds: None
+	try:
+		assert docker_updates.telegram("hi", chat=1) == 7
+	finally:
+		docker_updates.requests.post, docker_updates.time.sleep = original
+	assert sent == ["hi", "hi"]
+
+
+def test_an_update_stays_done_when_its_notice_is_lost():
+	# 2026-10-22 rsshub: the container was replaced, then the "updated" message hit a dropped
+	# connection and the worker marked the update failed.
+	from homelab import docker_updates
+	p = {"eid": 3, "cid": "old", "name": "rsshub", "environment": "Docker-VM", "old_image": "sha256:" + "a" * 64,
+		 "target": {"config": "sha256:" + "b" * 64, "ref": "diygod/rsshub:latest"}}
+	original = docker_updates.telegram, docker_updates.apply_update, docker_updates.API
+	docker_updates.telegram, docker_updates.API = dropped_connection, lambda: None
+	docker_updates.apply_update = lambda api, p, ident: {"new_id": "new", "image": "sha256:" + "b" * 64}
+	try:
+		for auto in (True, False):
+			ident = f"lost-notice-{auto}"
+			with docker_updates.db() as conn:
+				conn.execute("INSERT INTO candidates VALUES (?,?,?,?,?,?,?,?)",
+							 (ident, 3, "old", p["target"]["config"], json.dumps(p), "approved", 9e9, 1))
+			docker_updates.worker(ident, p, None, auto=auto)
+			with docker_updates.db() as conn:
+				row = conn.execute("SELECT status, data FROM candidates WHERE id=?", (ident,)).fetchone()
+			assert row["status"] == "done", (auto, row["status"])
+			assert json.loads(row["data"])["new_id"] == "new"
+	finally:
+		docker_updates.telegram, docker_updates.apply_update, docker_updates.API = original
+
+
+def test_cleanup_covers_updates_marked_failed_by_a_lost_notice():
+	from homelab import docker_updates
+	rows = {"done": ("done", {"applied": 1, "new_id": "n1"}),
+			"lost-notice": ("failed", {"applied": 1, "new_id": "n2"}),
+			"real-failure": ("failed", {}),
+			"cleanup-op": ("failed", {"applied": 1, "new_id": "n3", "operation": "cleanup"})}
+	with docker_updates.db() as conn:
+		conn.execute("DELETE FROM candidates")
+		for ident, (status, extra) in rows.items():
+			p = {"eid": 3, "cid": ident, "name": ident, "environment": "Docker-VM", **extra}
+			conn.execute("INSERT INTO candidates VALUES (?,?,?,?,?,?,?,?)", (ident, 3, ident, "t", json.dumps(p), status, 9e9, 1))
+	checked = []
+	original = docker_updates.cleanup_ready
+	docker_updates.cleanup_ready = lambda api, p: checked.append(p["cid"])
+	try:
+		result = docker_updates.scan_cleanup(None, notify=False)
+	finally:
+		docker_updates.cleanup_ready = original
+	assert sorted(checked) == ["done", "lost-notice"], checked
+	assert result["eligible"] == 2
+
+
 if __name__ == "__main__":
 	failed = 0
 	for name, fn in sorted(globals().items()):

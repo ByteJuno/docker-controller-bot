@@ -91,13 +91,29 @@ def matches(local,target):
     if target.get('kind')=='descriptor':return local.get('Descriptor',{}).get('digest')==target['digest']
     return local['Id']==target['config']
 
+# 连接断开、超时、429/5xx 隔 2 秒、5 秒各重试一次。读超时后重发可能多出一条重复消息，可以接受。
+TELEGRAM_RETRY_DELAYS=(2,5)
+
 def telegram(text,buttons=None,chat=None):
     data={'chat_id':chat or os.environ['TELEGRAM_ADMIN'].split(',')[0],'text':text[:4000]}
     if buttons:data['reply_markup']={'inline_keyboard':buttons}
-    r=requests.post('https://api.telegram.org/bot'+os.environ['TELEGRAM_TOKEN']+'/sendMessage',json=data,timeout=25)
+    for delay in (*TELEGRAM_RETRY_DELAYS,None):
+        try:r=requests.post('https://api.telegram.org/bot'+os.environ['TELEGRAM_TOKEN']+'/sendMessage',json=data,timeout=25)
+        except (requests.ConnectionError,requests.Timeout):
+            if delay is None:raise
+            time.sleep(delay);continue
+        if delay is None or not (r.status_code==429 or r.status_code>=500):break
+        time.sleep(delay)
     if not r.ok:raise RuntimeError('Telegram发送失败 HTTP '+str(r.status_code))
     if not r.json().get('ok'):raise RuntimeError('Telegram未确认发送')
     return r.json()['result']['message_id']
+
+def tell(text,chat=None):
+    """只告知结果的消息：发不出去记一行日志，不改变已经发生的事。
+    2026-10-22 rsshub 自动更新其实成功了，只是「已自动更新」那条赶上 Telegram 断开连接，
+    异常冒到 worker 的 except，把换好的更新标成 failed、发了「更新未完成」，回退容器也就不会被清理。"""
+    try:return telegram(text,chat=chat)
+    except Exception as ex:print('Telegram 通知未发出（'+type(ex).__name__+'）：'+text.split('\n',1)[0],file=sys.stderr,flush=True)
 
 def exclusion(c):
     name=c['Name'].lstrip('/');labels=c['Config'].get('Labels') or {};ref=labels.get('homelab.update.image') or c['Config']['Image']
@@ -159,7 +175,7 @@ def scan(notify=True):
                         result['notified']+=1
                 except Exception as ex:result['errors'].append(label+'/'+name+'：检查失败（'+type(ex).__name__+'）')
         if notify and result['errors']:
-            telegram('⚠️ Docker 更新检查有未完成项目\n'+'\n'.join(result['errors'])+'\n其余项目已照常检查，出错的项目未做任何更新。')
+            tell('⚠️ Docker 更新检查有未完成项目\n'+'\n'.join(result['errors'])+'\n其余项目已照常检查，出错的项目未做任何更新。')
         for ident,p in autos:
             with db() as conn:conn.execute("UPDATE candidates SET status='approved' WHERE id=? AND status='pending'",(ident,))
             worker(ident,p,None,auto=True)
@@ -211,10 +227,12 @@ def scan_cleanup(api,notify=True):
     """Delete rollback containers kept for KEEP_SECONDS whose replacement is healthy; --scan-dry only counts them."""
     result={'eligible':0,'removed':0,'gone':0,'errors':[]}
     removed=[]
-    with db() as conn:rows=conn.execute("SELECT id,data FROM candidates WHERE status='done'").fetchall()
+    with db() as conn:rows=conn.execute("SELECT id,status,data FROM candidates WHERE status IN ('done','failed')").fetchall()
     for row in rows:
         p=json.loads(row['data'])
         if p.get('operation')=='cleanup':continue
+        # 只有更新成功才会写 applied / new_id。带着它们的 failed 是修复 tell() 之前通知没发出去被误标的，照样清理。
+        if row['status']=='failed' and not (p.get('applied') and p.get('new_id')):continue
         with db() as conn:
             # Respect an earlier "保留旧容器" choice from the old confirm-to-clean flow.
             if conn.execute("SELECT 1 FROM candidates WHERE eid=? AND cid=? AND target LIKE 'cleanup:%' AND status='ignored'",(p['eid'],p['cid'])).fetchone():continue
@@ -242,7 +260,7 @@ def scan_cleanup(api,notify=True):
     if notify and removed:
         try:telegram('🧹 已自动删除保留满2天的旧容器\n'+'\n'.join(removed)+'\n新容器运行正常；镜像和数据卷均保留。')
         except Exception:result['errors'].append('清理结果通知发送失败')
-    if notify and result['errors']:telegram('⚠️ 旧容器清理未完成\n'+'\n'.join(result['errors']))
+    if notify and result['errors']:tell('⚠️ 旧容器清理未完成\n'+'\n'.join(result['errors']))
     return result
 
 def prune_images(api,notify=True):
@@ -269,7 +287,7 @@ def prune_images(api,notify=True):
     if notify and lines:
         try:telegram('🧹 已清理 %d 天前的无标签旧镜像\n' % (IMAGE_KEEP_HOURS//24)+'\n'.join(lines)+'\n带标签的镜像与数据卷不受影响。')
         except Exception:result['errors'].append('镜像清理通知发送失败')
-    if notify and result['errors']:telegram('⚠️ 旧镜像清理未完成\n'+'\n'.join(result['errors']))
+    if notify and result['errors']:tell('⚠️ 旧镜像清理未完成\n'+'\n'.join(result['errors']))
     return result
 
 # Build cache from the local auto-builds (bilitool, yyb-go, course-platform) is not an image, so
@@ -308,7 +326,7 @@ def prune_build_cache(api,notify=True):
     if notify and lines:
         try:telegram('🧹 已清理构建缓存（%d 小时未使用，或超过 %d GB 时按最久未用）\n' % (BUILD_CACHE_KEEP_HOURS,BUILD_CACHE_MAX_BYTES//1024**3)+'\n'.join(lines))
         except Exception:result['errors'].append('构建缓存清理通知发送失败')
-    if notify and result['errors']:telegram('⚠️ 构建缓存清理未完成\n'+'\n'.join(result['errors']))
+    if notify and result['errors']:tell('⚠️ 构建缓存清理未完成\n'+'\n'.join(result['errors']))
     return result
 
 def cleanup_worker(ident,p,chat):
@@ -320,10 +338,10 @@ def cleanup_worker(ident,p,chat):
             # No force and no volume removal: a concurrently started old container is protected by Docker.
             api.call(p['eid'],'/containers/'+p['cid']+'?force=0&v=0','DELETE')
             with db() as conn:conn.execute("UPDATE candidates SET status='done' WHERE id=?",(ident,))
-            telegram('✅ 已清理旧容器：'+p['environment']+' / '+p['name']+'\n新容器、镜像和数据卷均保留。',chat=chat)
+        tell('✅ 已清理旧容器：'+p['environment']+' / '+p['name']+'\n新容器、镜像和数据卷均保留。',chat=chat)
     except Exception as ex:
         with db() as conn:conn.execute("UPDATE candidates SET status='failed' WHERE id=?",(ident,))
-        telegram('⚠️ 旧容器清理未完成：'+p['name']+'\n'+(str(ex) if isinstance(ex,ValueError) else type(ex).__name__)+'\n请检查 Portainer，未自动重试。',chat=chat)
+        tell('⚠️ 旧容器清理未完成：'+p['name']+'\n'+(str(ex) if isinstance(ex,ValueError) else type(ex).__name__)+'\n请检查 Portainer，未自动重试。',chat=chat)
 
 def candidate(ident):
     with db() as conn:row=conn.execute('SELECT * FROM candidates WHERE id=?',(ident,)).fetchone()
@@ -457,12 +475,13 @@ def worker(ident,p,chat,auto=False):
         with open(ROOT/'apply.lock','w') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             with db() as conn:conn.execute("UPDATE candidates SET status='running' WHERE id=?",(ident,))
-            if not auto:telegram('⏳ 正在更新 '+p['environment']+' / '+p['name']+'\n将验证镜像和启动状态。',chat=chat)
+            if not auto:tell('⏳ 正在更新 '+p['environment']+' / '+p['name']+'\n将验证镜像和启动状态。',chat=chat)
             result=apply_update(API(),p,ident)
             # 'applied' 是回退容器诞生的时刻，保留期以它为准：容器被重启过会刷新 FinishedAt，
             # 用 FinishedAt 计时会让保留期无限延后（2026-09-21 遇到过两个放了 16 天没删的）。
             with db() as conn:conn.execute("UPDATE candidates SET status='done',data=? WHERE id=?",(json.dumps({**p,'new_id':result['new_id'],'applied':time.time()}),ident))
-            telegram(('🤖 已自动更新：' if auto else '✅ 更新完成：')+p['environment']+' / '+p['name']+'\n镜像：'+result['image'][7:19]+'\n旧容器已停止并保留供回退，满2天后由每日检查自动删除。',chat=chat)
+        # 已经记为 done：这条通知发不出去也不能再进下面的 except（见 tell）
+        tell(('🤖 已自动更新：' if auto else '✅ 更新完成：')+p['environment']+' / '+p['name']+'\n镜像：'+result['image'][7:19]+'\n旧容器已停止并保留供回退，满2天后由每日检查自动删除。',chat=chat)
     except TagMoved as ex:
         if auto:
             # 检查和执行之间标签又变了：本轮不动，下次检查按新版本自动更新。
@@ -471,11 +490,11 @@ def worker(ident,p,chat,auto=False):
         try:reoffer(ident,p,ex,chat)
         except Exception:
             with db() as conn:conn.execute("UPDATE candidates SET status='failed' WHERE id=?",(ident,))
-            telegram('⚠️ 更新未完成：'+p['environment']+' / '+p['name']+'\n标签已有更新版本，重新生成确认失败；等下次每日检查重新提示。',chat=chat)
+            tell('⚠️ 更新未完成：'+p['environment']+' / '+p['name']+'\n标签已有更新版本，重新生成确认失败；等下次每日检查重新提示。',chat=chat)
     except Exception as ex:
         with db() as conn:conn.execute("UPDATE candidates SET status='failed' WHERE id=?",(ident,))
         safe=str(ex) if isinstance(ex,ValueError) else type(ex).__name__
-        telegram(('⚠️ 自动更新未完成：' if auto else '⚠️ 更新未完成：')+p['environment']+' / '+p['name']+'\n'+safe+'\n请在 Portainer 检查当前状态；不会自动重试更新。'
+        tell(('⚠️ 自动更新未完成：' if auto else '⚠️ 更新未完成：')+p['environment']+' / '+p['name']+'\n'+safe+'\n请在 Portainer 检查当前状态；不会自动重试更新。'
                  +('\n这个版本下次检查改为发确认按钮。' if auto else ''),chat=chat)
 
 def install(bot,menu):
