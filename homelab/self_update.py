@@ -32,7 +32,7 @@ import requests
 
 from homelab import paths
 
-REPO = "Artifical0/docker-controller-bot"
+REPO = "ByteJuno/docker-controller-bot"
 IMAGE = "homelab/docker-controller-bot"
 TAG = re.compile(r"^homelab-v(\d+)\.(\d+)\.(\d+)-h(\d+)$")
 CHECK_EVERY = 6 * 3600
