@@ -41,8 +41,9 @@ COPY *.py /app/
 COPY locale /app/locale
 COPY homelab /app/homelab
 
+# The worker heartbeat goes stale when the bot stops processing commands.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-    CMD python3 -c "import sys; sys.exit(0)" || exit 1
+    CMD ["python3", "homelab/healthcheck.py"]
 
 ENTRYPOINT ["python3", "homelab/main.py"]
 

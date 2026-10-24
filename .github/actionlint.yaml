@@ -1,0 +1,5 @@
+# actionlint 1.7.12 predates the hosted Ubuntu 26.04 label.
+# Both Docker matrix labels have already run successfully in this repository.
+self-hosted-runner:
+  labels:
+    - ubuntu-26.04
