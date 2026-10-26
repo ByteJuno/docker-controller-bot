@@ -6,6 +6,17 @@ Ubuntu 24.04/26.04. The plugin suite and standalone health/CI regression suites
 run before publication. The image probe is checked with a missing, fresh and
 stale heartbeat in a disposable container without network, config or sockets.
 
+## Upstream releases
+
+New upstream releases are no longer merged on a schedule. `upstream_merge.py`
+on the lab has gpt-6.1-sol review each new upstream release, merge it on an
+`upstream-sync/<tag>` branch (resolving conflicts if needed) and open a pull
+request into `homelab`. Pull requests run every test job but skip publish and
+the failure report; the script reads the checks, merges the pull request when
+they pass, and reports to the owner on Telegram. That merge is a normal push to
+`homelab`, which publishes the deployable tag. A manual dispatch still merges
+the newest upstream release directly.
+
 ## Publish boundary
 
 The publish job runs on a fresh hosted runner and only downloads the exact

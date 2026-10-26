@@ -17,7 +17,7 @@
 
 ## 更新流程
 
-1. **CI**（`.github/workflows/homelab.yml`）：每次推送 `homelab` 跑上游的全部测试和插件测试、试构建镜像，通过后打 `homelab-v<上游版本>-h<提交数>` 标签。每天 01:17 UTC 先尝试合并上游最新的正式版本；合并冲突或测试不过就开一个 `upstream-sync` issue，不推送。
+1. **CI**（`.github/workflows/homelab.yml`）：每次推送 `homelab` 跑上游的全部测试和插件测试、试构建镜像，通过后打 `homelab-v<上游版本>-h<提交数>` 标签；测试不过就开（或更新）一个 `upstream-sync` issue，不推送。上游出了新的正式版本，由 lab 上的 `upstream_merge.py` 交给 gpt-6.1-sol 审核并合并到 `upstream-sync/<版本>` 分支（有冲突也由它解决），再向 `homelab` 开 PR；PR 跑全部测试但不打标签，测试通过后脚本自动合并，结果私聊机主。手动运行这个 workflow 仍会直接合并上游最新正式版。
 2. **机器人**（`self_update.py`）：每 6 小时看一次这些标签，有更新的就在自己所在的 Docker 主机上构建，构建好后在 Telegram 发「部署 / 忽略此版本」按钮。`upstream-sync` issue 也会提醒一次。
 3. **部署**：点「部署」后经 Portainer 把 bot 的 Stack 换成新镜像；新 bot 启动后报告「已更新」。没起来的话，外部的看门狗 5 分钟后换回旧镜像，旧 bot 报告「已回滚」。
 

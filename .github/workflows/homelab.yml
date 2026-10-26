@@ -1,20 +1,26 @@
 # Prepare one candidate, test that exact commit, then publish it atomically.
 # The deploy key exists only in the isolated publish job: no candidate code or
 # dependency install runs there. Production still deploys via Telegram approval.
+#
+# New upstream releases arrive as pull requests from upstream_merge.py on the
+# lab (gpt-6.1-sol reviews and merges them). Pull requests run every test but
+# never publish or open issues; merging one pushes homelab, which publishes.
+# A manual dispatch still merges the newest upstream release itself.
 name: homelab
 
 on:
   push:
     branches: [homelab]
-  schedule:
-    - cron: "17 1 * * *"
+  pull_request:
+    branches: [homelab]
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: homelab
+  # Pull requests get their own group: a queued publish must not cancel them.
+  group: ${{ github.event_name == 'pull_request' && format('homelab-pr-{0}', github.ref) || 'homelab' }}
   cancel-in-progress: false
 
 jobs:
@@ -56,7 +62,7 @@ jobs:
           git fetch --quiet upstream --tags
           latest=$(git tag -l 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sed -n '1p')
           test -n "$latest"
-          if [ "$EVENT_NAME" != push ] && ! git merge-base --is-ancestor "$latest" HEAD; then
+          if [ "$EVENT_NAME" = workflow_dispatch ] && ! git merge-base --is-ancestor "$latest" HEAD; then
             # The current run tests this merge; avoid a duplicate push workflow.
             git merge --no-edit -m "Merge upstream $latest into homelab [skip ci]" "$latest"
           fi
@@ -214,6 +220,7 @@ jobs:
   publish:
     name: Publish tested version
     needs: [prepare, unit, image, docker]
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
@@ -286,7 +293,7 @@ jobs:
   report:
     name: Report any failed stage
     needs: [prepare, unit, image, docker, publish]
-    if: ${{ always() && contains(needs.*.result, 'failure') }}
+    if: ${{ always() && github.event_name != 'pull_request' && contains(needs.*.result, 'failure') }}
     runs-on: ubuntu-26.04
     timeout-minutes: 5
     permissions:
