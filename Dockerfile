@@ -3,7 +3,7 @@ ARG BASE_IMAGE=alpine:3.24.3
 FROM ${BASE_IMAGE}
 ARG BASE_IMAGE
 
-ARG VERSION=5.2.0
+ARG VERSION=5.3.2
 # The sha256 of the release's source zip, to build only what was released:
 #   --build-arg APP_SHA256=$(curl -fsSL https://github.com/dgongut/docker-controller-bot/archive/refs/tags/v<version>.zip | sha256sum | cut -d' ' -f1)
 # A tag can be moved; with this a moved one fails the build instead of
@@ -34,27 +34,7 @@ RUN apk add --no-cache python3 py3-pip tzdata curl unzip py3-paramiko openssh-cl
     curl -fsSL https://github.com/dgongut/docker-controller-bot/archive/refs/tags/v${VERSION}.zip -o /tmp/app.zip && \
     if [ -n "${APP_SHA256}" ]; then echo "${APP_SHA256}  /tmp/app.zip" | sha256sum -c -; fi && \
     unzip -q /tmp/app.zip -d /tmp && \
-    mv /tmp/docker-controller-bot-${VERSION}/docker-controller-bot.py /app && \
-    mv /tmp/docker-controller-bot-${VERSION}/core.py /app && \
-    mv /tmp/docker-controller-bot-${VERSION}/commands.py /app && \
-    mv /tmp/docker-controller-bot-${VERSION}/callbacks.py /app && \
-    mv /tmp/docker-controller-bot-${VERSION}/config.py /app && \
-    mv /tmp/docker-controller-bot-${VERSION}/store.py /app && \
-    mv /tmp/docker-controller-bot-${VERSION}/migration.py /app && \
-    mv /tmp/docker-controller-bot-${VERSION}/callback_registry.py /app && \
-    mv /tmp/docker-controller-bot-${VERSION}/host_registry.py /app && \
-    mv /tmp/docker-controller-bot-${VERSION}/container_listing.py /app && \
-    mv /tmp/docker-controller-bot-${VERSION}/i18n.py /app && \
-    mv /tmp/docker-controller-bot-${VERSION}/docker_update.py /app && \
-    mv /tmp/docker-controller-bot-${VERSION}/docker_compose_manager.py /app && \
-    mv /tmp/docker-controller-bot-${VERSION}/compose_generator.py /app && \
-    mv /tmp/docker-controller-bot-${VERSION}/formatting.py /app && \
-    mv /tmp/docker-controller-bot-${VERSION}/own_container.py /app && \
-    mv /tmp/docker-controller-bot-${VERSION}/schedule_manager.py /app && \
-    mv /tmp/docker-controller-bot-${VERSION}/port_manager.py /app && \
-    mv /tmp/docker-controller-bot-${VERSION}/logger.py /app && \
-    mv /tmp/docker-controller-bot-${VERSION}/message_queue.py /app && \
-    mv /tmp/docker-controller-bot-${VERSION}/locale /app && \
+    mv /tmp/docker-controller-bot-${VERSION}/src/* /app && \
     mv /tmp/docker-controller-bot-${VERSION}/requirements.txt /app && \
     rm -rf /tmp/app.zip /tmp/docker-controller-bot-${VERSION}/ && \
     apk del --no-cache curl unzip && \
