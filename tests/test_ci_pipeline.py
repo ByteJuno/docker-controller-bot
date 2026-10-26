@@ -87,6 +87,27 @@ def test_main_normalises_needs_results_without_live_api():
 	assert "/attempts/2" in captured["body"]
 
 
+def test_report_copy_survives_issue_api_failure():
+	import json
+	import os
+	import tempfile
+	from unittest.mock import patch
+	with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {
+		"GITHUB_REPOSITORY": "owner/repo", "GITHUB_RUN_ID": "99", "GITHUB_RUN_ATTEMPT": "1",
+		"JOB_RESULTS": json.dumps({"docker": {"result": "failure"}}),
+		"GITHUB_STEP_SUMMARY": "", "RUNNER_TEMP": folder}), \
+		patch.object(report, "collect_jobs", return_value=[]), \
+		patch.object(report, "upsert_issue", side_effect=urllib.error.HTTPError("https://example.invalid", 410, "disabled", {}, None)):
+		try:
+			report.main()
+		except urllib.error.HTTPError:
+			pass
+		else:
+			raise AssertionError("reporting failure must not be hidden")
+		body = Path(folder, "homelab-failure-report.md").read_text()
+		assert "docker" in body and "/actions/runs/99/attempts/1" in body
+
+
 if __name__ == "__main__":
 	failed = 0
 	for name, function in sorted(list(globals().items())):

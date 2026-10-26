@@ -28,6 +28,15 @@ jobs:
       tag: ${{ steps.candidate.outputs.tag }}
       bundle_id: ${{ steps.bundle.outputs.artifact-id }}
     steps:
+      - name: Validate failure reporting configuration
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          test "$(gh api "repos/$REPOSITORY" --jq .has_issues)" = true || {
+            echo '::error::Enable repository Issues: CI failures are delivered through upstream-sync issues.'
+            exit 1
+          }
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
@@ -111,6 +120,7 @@ jobs:
           python3 tests/test_homelab.py
           python3 tests/test_homelab_healthcheck.py
           python3 tests/test_ci_pipeline.py
+          python3 tests/test_oom_fallback.py
 
   image:
     name: Homelab image and Alpine tests
@@ -142,7 +152,8 @@ jobs:
             python3 tests/run_all.py
             python3 tests/test_homelab.py
             python3 tests/test_homelab_healthcheck.py
-            python3 tests/test_ci_pipeline.py'
+            python3 tests/test_ci_pipeline.py
+            python3 tests/test_oom_fallback.py'
       - name: Verify real image healthcheck
         working-directory: candidate
         run: python3 tests/test_homelab_healthcheck.py --image homelab-ci
@@ -188,6 +199,17 @@ jobs:
       - name: Docker integration tests
         working-directory: candidate
         run: python3 tests/run_all.py --docker
+      - name: Repeat real OOM event regression
+        working-directory: candidate
+        run: |
+          python3 - <<'PYTEST'
+          import sys
+          sys.path.insert(0, 'tests')
+          import test_real_docker as tests
+          for attempt in range(3):
+              tests.test_the_event_monitor_says_why_a_container_stopped_and_when_it_is_unhealthy()
+              print(f'real OOM/health event regression {attempt + 1}/3: passed', flush=True)
+          PYTEST
 
   publish:
     name: Publish tested version
@@ -281,3 +303,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           JOB_RESULTS: ${{ toJSON(needs) }}
         run: python3 ci/report_failure.py
+      - name: Preserve failure report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: homelab-failure-report
+          path: ${{ runner.temp }}/homelab-failure-report.md
+          retention-days: 7
+          if-no-files-found: warn

@@ -1601,7 +1601,22 @@ class DockerEventMonitor:
 		code = str(attributes.get('exitCode', '')).strip()
 		if code in ("", "0"):
 			return get_text("container_finished" if code == "0" else "stopped_container", name), None
+		# Docker can deliver die before oom, especially around reconnects.
+		# SIGKILL also exits 137: require Docker's terminal OOMKilled state,
+		# not the exit code alone. Explicit user stops above still win.
+		if code == "137" and self._inspect_oom_killed(container_id):
+			return get_text("container_oom", name), None
 		return get_text("container_failed", name, describe_exit_code(code)), self._last_logs(container_id)
+
+	def _inspect_oom_killed(self, container_id):
+		if not container_id:
+			return False
+		container = self._inspect(container_id)
+		if container is None:
+			return False
+		state = container.attrs.get("State") or {}
+		return (state.get("OOMKilled") is True and state.get("Running") is False
+				and str(state.get("ExitCode")) == "137")
 
 	def _health_message(self, name, status, container_id):
 		"""

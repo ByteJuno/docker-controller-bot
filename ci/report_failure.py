@@ -102,6 +102,9 @@ def main():
 	if os.environ.get("GITHUB_STEP_SUMMARY"):
 		with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as stream:
 			stream.write(body)
+	# Preserve an independent copy before attempting issue creation/update.
+	if os.environ.get("RUNNER_TEMP"):
+		Path(os.environ["RUNNER_TEMP"], "homelab-failure-report.md").write_text(body)
 	issue = upsert_issue(repository, title, body)
 	print(f"Failure reported: {issue['html_url']}")
 
@@ -111,4 +114,6 @@ if __name__ == "__main__":
 		main()
 	except urllib.error.HTTPError as error:
 		# Never dump request headers or credentials into an Actions log.
-		raise SystemExit(f"Failure reporting API returned HTTP {error.code}") from None
+		if error.code == 410:
+			raise SystemExit("Repository Issues are disabled. Enable Issues; the report remains in the job summary/artifact.") from None
+		raise SystemExit(f"Failure reporting API returned HTTP {error.code}; see preserved report artifact") from None

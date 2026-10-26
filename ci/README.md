@@ -39,3 +39,19 @@ sending Telegram messages. The `report` job is skipped after a successful run.
 This pipeline **never deploys the production container**. New versions continue
 to require the existing Telegram Deploy confirmation. The new heartbeat check
 only takes effect when an image containing it is deployed.
+
+## Failure delivery prerequisite and OOM regression
+
+Repository **Issues must remain enabled**: `upstream-sync` is the bot's existing
+failure-delivery channel. Preparation now verifies this prerequisite before
+running expensive tests. Reporting preserves the Markdown summary as a retained
+artifact even if an issue API call fails. A disabled-Issues response gives an
+explicit diagnostic rather than a bare HTTP error.
+
+For Docker exit 137, event monitoring falls back to inspecting the exact
+container ID and requires `OOMKilled=true`, `Running=false`, and exit code 137.
+SIGKILL alone is never called an OOM; explicit requested stops still win. The
+normal `oom`-before-`die` fast path remains unchanged. Eight isolated regression
+tests cover missing/late OOM events, ordinary SIGKILL, requested stops, missing
+containers and restart-state races. The original real-Docker event test remains
+strict and is additionally repeated three times on **each** Docker runner.
