@@ -1499,7 +1499,12 @@ volumes:
 			assert expected in plex, (expected, plex)
 		qb, _, can_start, _ = owner.get_info(fetch("qb").id, PREFIX + "qb")
 		assert can_start
-		for expected in (core.get_text("info_oom"), "137 (SIGKILL)", f"<code>{PREFIX}vpn</code>",
+		# The card reads State.OOMKilled, and on a loaded runner Docker can lose
+		# the "oom" that sets it (as test above notes): then the kill shows as
+		# a plain 137 and the card must not claim it ran out of memory.
+		oom_known = client.api.inspect_container(PREFIX + "qb")["State"]["OOMKilled"]
+		assert (core.get_text("info_oom") in qb) == oom_known, (oom_known, qb)
+		for expected in ("137 (SIGKILL)", f"<code>{PREFIX}vpn</code>",
 							core.get_text("info_privileged"), "RAM 8.0 MiB"):
 			assert expected in qb, (expected, qb)
 		vpn_info, _, _, _ = owner.get_info(vpn.id, vpn.name)
