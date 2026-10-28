@@ -1443,8 +1443,12 @@ class DockerEventMonitor:
 		self._unhealthy = set()
 		self._oom = {}
 		# Inspect may confirm OOM before its event arrives; consume that late
-		# event without attributing it to the next container run.
-		self._inspect_oom_reported = set()
+		# event without attributing it to the next container run. Name -> when
+		# the inspect fallback reported it: kept across the restart's "start",
+		# because the late "oom" can arrive after it, and only honoured for
+		# OOM_SECONDS so a real OOM of a later run is not swallowed for long
+		# (a 137 of that run is still caught by the inspect fallback).
+		self._inspect_oom_reported = {}
 		# Stops that read as a kill nobody asked for, held in case the "oom"
 		# that explains them comes just after: name -> (the timer that sends
 		# them anyway, their message, its detail).
@@ -1581,14 +1585,17 @@ class DockerEventMonitor:
 			self.restart_loops.should_announce(action, container_name)
 			return
 		if action == "oom":
-			if container_name in self._inspect_oom_reported:
-				self._inspect_oom_reported.discard(container_name)
+			if self._release_death(container_name, oom=True):
+				self._inspect_oom_reported.pop(container_name, None)
 				return
-			if not self._release_death(container_name, oom=True):
-				self._oom[container_name] = time.time()
+			reported = self._inspect_oom_reported.pop(container_name, None)
+			if reported is not None and time.time() - reported <= self.OOM_SECONDS:
+				# The late event of a run already reported as OOM by inspect.
+				return
+			self._oom[container_name] = time.time()
 			return
 		if action == "destroy":
-			self._inspect_oom_reported.discard(container_name)
+			self._inspect_oom_reported.pop(container_name, None)
 			self._unhealthy.discard(container_name)
 			self._oom.pop(container_name, None)
 			return
@@ -1598,7 +1605,6 @@ class DockerEventMonitor:
 		may_be_oom = False
 		if action == "start":
 			self._oom.pop(container_name, None)
-			self._inspect_oom_reported.discard(container_name)
 			message = get_text("started_container", container_name)
 		elif action == "die":
 			message, detail, may_be_oom = self._death_message(container_name, attributes, container_id)
@@ -1663,7 +1669,7 @@ class DockerEventMonitor:
 		# negative inspection is not conclusive: the "oom" event may still
 		# arrive later, so an unexplained 137 keeps the upstream wait.
 		if code == "137" and self._inspect_oom_killed(container_id):
-			self._inspect_oom_reported.add(name)
+			self._inspect_oom_reported[name] = time.time()
 			return get_text("container_oom", name), None, False
 		return (get_text("container_failed", name, describe_exit_code(code)), self._last_logs(container_id),
 				code == "137")
