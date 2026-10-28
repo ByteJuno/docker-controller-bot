@@ -6,6 +6,7 @@ every test runs against that instance. They share it deliberately: the module
 is global state by design, and loading it is the slow part.
 """
 
+import html
 import io
 import json
 import os
@@ -339,7 +340,7 @@ def test_answering_the_mute_prompt_goes_through_the_registry():
 	reached it: the static check did.
 	"""
 	assert "/mute" in dcb.COMMAND_ACTIONS
-	source = io.open(os.path.join(harness.REPO, "core.py"), encoding="utf-8").read()
+	source = io.open(os.path.join(harness.SRC, "core.py"), encoding="utf-8").read()
 	assert "cmd_mute(" not in source, "el núcleo no debe llamar a un comando por su nombre"
 
 
@@ -363,7 +364,7 @@ def test_mute_asks_for_its_argument_when_pressed_as_a_button():
 
 def _registered_commands():
 	"""The command names the Telegram handler is subscribed to."""
-	path = os.path.join(harness.REPO, "core.py")
+	path = os.path.join(harness.SRC, "core.py")
 	line = [l for l in io.open(path, encoding="utf-8")
 			if l.startswith("@bot.message_handler(commands=")][0]
 	return set(re.findall(r'"([a-z]+)"', line))
@@ -439,7 +440,7 @@ def test_no_locale_carries_keys_nobody_reads():
 # short as the code allows.
 DYNAMIC_TEXT_PREFIXES = (
 	"start_cat_", "start_cmd_", "schedule_prune_", "schedule_action_",
-	"confirm_prune_",
+	"schedule_label_", "schedule_edit_", "confirm_prune_",
 )
 
 
@@ -1261,40 +1262,18 @@ def test_the_same_question_names_no_host_when_there_is_only_one():
 _VALUE_FOR = {
 	"pickHost": "host", "portsHost": "host", "pruneHost": "host", "prune": "host",
 	"settingsHost": "host", "settingsHostRename": "host", "settingsHostRemove": "host",
-	"scheduleSelectHost": "host", "generatePort": "host", "checkPort": "host",
+	"generatePort": "host", "checkPort": "host",
 	# Deliberately a host that is not registered: this one actually removes.
 	"settingsHostRemoveConfirm": "h_nonexistent",
 	"settingsSetColumns": "2", "settingsSetLanguage": "ES",
 	"startCategory": "system", "startCommand": "list",
-	"scheduleEditValue": "0 0 * * *",
 }
 
 _ARG_FOR = {
-	"containerName": "nginx", "action": "prune Images", "scheduleHash": "deadbeef",
+	"containerName": "nginx", "action": "prune Images",
 	"field": "cron", "scheduleId": "1", "commandId": "cmd1", "tag": "latest",
-	"originalMessageId": "42", "containerIdx": "0", "pruneType": "images",
+	"originalMessageId": "42", "containerIdx": "0",
 }
-
-
-def test_the_schedule_list_is_never_handed_out_live():
-	"""
-	get_all_schedules used to return the manager's own list. The executor
-	iterates it while a button press may be adding or deleting, and a caller
-	could change the manager's state just by appending to what it thought was
-	its own copy.
-	"""
-	manager = dcb.schedule_manager
-	for existing in list(manager.get_all_schedules()):
-		manager.delete_schedule(existing["name"])
-	manager.add_schedule(name="una", cron="@daily", action="restart", container="nginx")
-	try:
-		mine = manager.get_all_schedules()
-		assert mine is not manager.get_all_schedules(), "devuelve la lista interna"
-		mine.append({"name": "inyectada"})
-		assert [s["name"] for s in manager.get_all_schedules()] == ["una"], (
-			"un append del llamante ha cambiado el estado del manager")
-	finally:
-		manager.delete_schedule("una")
 
 
 def test_schedules_are_written_atomically():
@@ -1306,7 +1285,7 @@ def test_schedules_are_written_atomically():
 	"""
 	import ast
 
-	source = io.open(os.path.join(harness.REPO, "schedule_manager.py"),
+	source = io.open(os.path.join(harness.SRC, "schedule_manager.py"),
 						encoding="utf-8").read()
 	tree = ast.parse(source)
 	writers = [n for n in ast.walk(tree)
@@ -1319,61 +1298,6 @@ def test_schedules_are_written_atomically():
 									and isinstance(statement.value, ast.Constant)))
 		assert "store.write_document" in code, f"{writer.name} no escribe por store:\n{code}"
 		assert "open(" not in code, f"{writer.name} escribe sobre el fichero real:\n{code}"
-
-
-def test_concurrent_edits_to_the_schedules_do_not_lose_any():
-	"""
-	The executor thread and telebot's workers touch this at the same time, and
-	the lock only covered the file, not the cache or the id counter.
-	"""
-	import threading
-
-	manager = dcb.schedule_manager
-	for existing in list(manager.get_all_schedules()):
-		manager.delete_schedule(existing["name"])
-	start = threading.Barrier(8)
-
-	def add(index):
-		start.wait()
-		manager.add_schedule(name=f"t{index}", cron="@daily",
-							action="restart", container="nginx")
-
-	workers = [threading.Thread(target=add, args=(i,), daemon=True) for i in range(8)]
-	for worker in workers:
-		worker.start()
-	for worker in workers:
-		worker.join(10)
-	try:
-		stored = manager.get_all_schedules()
-		assert len(stored) == 8, [s["name"] for s in stored]
-		identifiers = [s["id"] for s in stored]
-		assert len(set(identifiers)) == 8, f"ids repetidos: {sorted(identifiers)}"
-	finally:
-		for existing in list(manager.get_all_schedules()):
-			manager.delete_schedule(existing["name"])
-
-
-def test_the_schedule_flow_state_lives_in_the_volume():
-	"""
-	It used to be written to a relative `./cache/`, which under the image's
-	WORKDIR meant inside the container instead of the mapped volume: nothing
-	swept it, and its errors went to stdout with print() rather than the log.
-	"""
-	import glob
-
-	dcb.save_schedule_state(4242, {"step": "ask_name", "name": None})
-	try:
-		loaded = dcb.load_schedule_state(4242)
-		# Plus where and when the question was asked, which decides whether a
-		# message can still answer it.
-		assert {k: loaded[k] for k in ("step", "name")} == {"step": "ask_name", "name": None}, loaded
-		assert {"asked_in", "asked_at"} <= set(loaded), loaded
-		found = glob.glob(os.path.join(store.root(), "**", "*schedule_state_4242*"),
-							recursive=True)
-		assert found, "el estado no está dentro del volumen de almacenamiento"
-	finally:
-		dcb.clear_schedule_state(4242)
-	assert dcb.load_schedule_state(4242) is None
 
 
 def test_an_absurd_mute_does_not_silence_the_bot_for_good():
@@ -1655,7 +1579,7 @@ def _press_every_button_through_the_dispatcher():
 	project_hash = dcb.register_project_hash("media", local)
 
 	values = dict(_VALUE_FOR, generatePort="host", checkPort="host")
-	arguments = dict(_ARG_FOR, containerName=project_hash, scheduleHash=project_hash)
+	arguments = dict(_ARG_FOR, containerName=project_hash)
 
 	ran, broken = set(), []
 	specs = callback_registry.specs()
@@ -1686,7 +1610,13 @@ def _press_every_button_through_the_dispatcher():
 			press.data, press.id = data, "q1"
 			# In the admin's private chat: buttons are only taken where commands are.
 			press.message.id, press.message.chat.id, press.message.chat.type = 2, admin, "private"
+			press.message.date, press.message.edit_date = int(time.time()), None
 			press.from_user.id, press.from_user.username = admin, "test"
+			# The names saved as the menus save them, again for every press: a
+			# press that closes its message forgets them. Without them only the
+			# five characters of the ID are left, and a stub container has no
+			# creation date to tell it from one created after the message.
+			dcb.save_container_refs(admin, 2, [(f"{local}:abc12", "nginx")])
 			try:
 				dcb.button_controller(press)
 			except Exception as e:
@@ -1694,6 +1624,7 @@ def _press_every_button_through_the_dispatcher():
 	finally:
 		for name, handler in original.items():
 			specs[name].handler = handler
+		dcb.clear_container_cache(admin, 2)
 	return ran, broken
 
 
@@ -2356,7 +2287,7 @@ def _quiet_bot():
 	"""Silences everything that leaves the process, and returns the undo."""
 	sent = MagicMock(message_id=1)
 	sent.chat.id = 1
-	names = ("send_message", "edit_message_text", "send_document",
+	names = ("send_message", "edit_message_text", "edit_message_text_sync", "send_document",
 				"send_message_to_notification_channel")
 	silent = ("delete_message", "edit_message_reply_markup",
 				"edit_message_reply_markup_sync", "answer_callback_quietly")
@@ -3048,24 +2979,6 @@ def test_every_command_with_a_picker_can_disambiguate():
 		assert callback_registry.get(spec["container_callback"]) is not None, spec
 
 
-def test_a_scheduled_task_resolves_on_its_own_host():
-	"""
-	A task names a container, and acting on a same-named container elsewhere
-	would be silent and, for stop or exec, destructive.
-	"""
-	_with_hosts(HOST_FIXTURE, unreachable=())
-	plex = _container("plex", "running")
-	original = dcb.DockerManager.container_named
-	dcb.DockerManager.container_named = lambda self, name: plex if name == "plex" else None
-	try:
-		ref = dcb.schedule_container_ref("h_nas", "plex")
-		assert dcb.ref_host(ref) == "h_nas", ref
-		assert dcb.schedule_container_ref("h_nas", "noexiste") is None
-	finally:
-		dcb.DockerManager.container_named = original
-		_restore_hosts()
-
-
 def test_a_host_screen_asks_only_for_the_host():
 	"""
 	It used to borrow the action's own prompt, so /prune asked for an object
@@ -3252,7 +3165,7 @@ def test_two_listings_at_once_both_see_a_healthy_host():
 
 def test_ssh_hosts_are_bounded_in_every_image():
 	"""docker-py reads the ssh pipe with no timeout; ssh's own keepalive is the only bound."""
-	for name in ("Dockerfile", "Dockerfile_debug", "Dockerfile_local"):
+	for name in ("Dockerfile", "dev/Dockerfile_debug", "dev/Dockerfile_local"):
 		with open(os.path.join(harness.REPO, name), encoding="utf-8") as f:
 			text = f.read()
 		for option in ("BatchMode yes", "ConnectTimeout", "ServerAliveInterval", "ServerAliveCountMax"):
@@ -3297,53 +3210,6 @@ def test_a_project_on_an_unreachable_host_gives_no_names():
 	try:
 		assert dcb.get_project_container_names("media", "h_nas") == []
 	finally:
-		_restore_hosts()
-
-
-def test_scheduling_offers_containers_from_every_host():
-	_with_hosts(HOST_FIXTURE, unreachable=())
-	original = dcb.DockerManager.list_containers
-	dcb.DockerManager.list_containers = lambda self, comando="": (
-		[_container("plex", "running")] if self.host_id == "h_nas" else [_container("nginx", "running")])
-	try:
-		available = dcb._get_available_containers()
-		assert {entry["id"] for entry, _ in available} == {"h_local", "h_nas"}
-		assert {container.name for _, container in available} == {"nginx", "plex"}
-	finally:
-		dcb.DockerManager.list_containers = original
-		_restore_hosts()
-
-
-def test_editing_a_tasks_container_offers_every_host_and_moves_the_host_too():
-	"""
-	The edit screen still read container.name off what is now (host, container)
-	pairs, so choosing "Container" raised. And the value it saved was the name
-	alone: the task kept its old host and pointed at a namesake, or at nothing.
-	"""
-	_with_hosts(HOST_FIXTURE, unreachable=())
-	original_list = dcb.DockerManager.list_containers
-	dcb.DockerManager.list_containers = lambda self, comando="": (
-		[_container("plex", "running")] if self.host_id == "h_nas" else [_container("nginx", "running")])
-	undo = _quiet_bot()
-	manager = dcb.schedule_manager
-	manager.add_schedule(name="editame", cron="@daily", action="restart", container="nginx", host="h_local")
-	try:
-		task = next(s for s in manager.get_all_schedules() if s["name"] == "editame")
-		base = {"call": MagicMock(id="q1"), "chatId": 1, "messageId": 2, "userId": 77,
-				"comando": "x", "multiAction": None, "hostId": "h_local", "containerId": None}
-		callbacks.cb_scheduleEditField(callback_registry.Context(
-			**base, field="container", scheduleId=str(task["id"])))
-		state = dcb.load_schedule_state(77)
-		idx = next(k.split("_")[1] for k, v in state.items() if k.startswith("container_") and v == "plex")
-		assert state[f"container_host_{idx}"] == "h_nas", state
-		callbacks.cb_scheduleEditValue(callback_registry.Context(
-			**base, field="container", scheduleId=str(task["id"]), value=idx))
-		edited = manager.get_schedule_by_id(task["id"])
-		assert (edited["container"], edited["host"]) == ("plex", "h_nas"), edited
-	finally:
-		manager.delete_schedule("editame")
-		undo()
-		dcb.DockerManager.list_containers = original_list
 		_restore_hosts()
 
 
@@ -3394,19 +3260,6 @@ def test_a_message_cached_before_the_host_was_stored_still_says_it():
 		dcb.clear_container_cache(1, 2)
 
 
-def test_the_bot_is_never_offered_to_a_scheduled_task():
-	_with_hosts([HOST_FIXTURE[0]], unreachable=())
-	original = dcb.DockerManager.list_containers
-	dcb.DockerManager.list_containers = lambda self, comando="": [
-		_container(dcb.CONTAINER_NAME, "running"), _container("nginx", "running")]
-	try:
-		names = {container.name for _, container in dcb._get_available_containers()}
-		assert names == {"nginx"}, names
-	finally:
-		dcb.DockerManager.list_containers = original
-		_restore_hosts()
-
-
 def _assert_telegram_html(text, where=""):
 	"""
 	Fails unless Telegram would parse `text`: only the tags it knows, balanced.
@@ -3437,100 +3290,6 @@ def _assert_telegram_html(text, where=""):
 	import re
 	stray = re.sub(r"</?(?:%s)(?:\s[^>]*)?>" % "|".join(sorted(allowed, key=len, reverse=True)), "", text)
 	assert "<" not in stray, f"{where}: «<» sin escapar en {text!r}"
-
-
-def test_what_the_user_typed_in_a_schedule_never_breaks_its_screens():
-	"""
-	A scheduled `mysql < dump.sql`, or a task called "copia <diaria>", went into
-	the HTML raw: Telegram rejected the message, and /schedule failed to open
-	every time from then on.
-	"""
-	_with_hosts([HOST_FIXTURE[0]], unreachable=())
-	task = {"id": 7, "name": "copia <diaria> & co", "cron": "@daily", "action": "exec",
-			"container": "db<x>", "command": "mysql < dump.sql > out", "show_output": True,
-			"host": "h_local", "enabled": True}
-	sent = []
-	original = (dcb.send_message, dcb.schedule_manager.get_all_schedules,
-				dcb.schedule_manager.get_schedule, dcb.schedule_manager.get_schedule_by_id,
-				dcb.schedule_manager.update_schedule, dcb.schedule_manager.delete_schedule)
-	dcb.send_message = lambda **kwargs: sent.append(kwargs.get("message", "")) or MagicMock(message_id=1)
-	dcb.schedule_manager.get_all_schedules = lambda: [task]
-	dcb.schedule_manager.get_schedule = lambda _name: task
-	dcb.schedule_manager.get_schedule_by_id = lambda _id: task
-	dcb.schedule_manager.update_schedule = lambda *a, **k: True
-	try:
-		texts = {"resumen": dcb._build_schedule_summary(task)}
-		dcb.show_schedule_menu(1, 1)
-		dcb.show_schedule_edit_options(1, task["name"])
-		base = {"call": MagicMock(id="q"), "chatId": 1, "messageId": 2, "userId": 1,
-				"comando": "x", "multiAction": None, "hostId": "h_local", "containerId": None}
-		for field in ("name", "command"):
-			callbacks.cb_scheduleEditField(callback_registry.Context(**base, field=field, scheduleId="7"))
-		callbacks.cb_scheduleEditValue(callback_registry.Context(**base, field="show_output", scheduleId="7", value="yes"))
-		for i, text in enumerate(sent):
-			texts[f"mensaje {i}"] = text
-		for where, text in texts.items():
-			_assert_telegram_html(text, where)
-		joined = "\n".join(texts.values())
-		assert "&lt;diaria&gt;" in joined and "mysql &lt; dump.sql" in joined, joined
-	finally:
-		(dcb.send_message, dcb.schedule_manager.get_all_schedules, dcb.schedule_manager.get_schedule,
-			dcb.schedule_manager.get_schedule_by_id, dcb.schedule_manager.update_schedule,
-			dcb.schedule_manager.delete_schedule) = original
-		_restore_hosts()
-
-
-def test_the_schedule_wizard_survives_whatever_is_typed_into_it():
-	"""
-	Every step of creating a task, fed what a user might type: a name with
-	`<`, `&` and quotes, a cron that is not one, minutes that are not a
-	number, a command with redirections. Each screen it answers with has to
-	be one Telegram accepts, or the wizard stops halfway with no message.
-	"""
-	_with_hosts([HOST_FIXTURE[0]], unreachable=())
-	nasty = 'copia <diaria> & "co"'
-	sent = []
-	original = (dcb.send_message, dcb.save_schedule_state, dcb.schedule_manager.get_schedule,
-				dcb.schedule_manager.add_schedule, dcb.delete_message)
-	dcb.send_message = lambda **kwargs: sent.append(kwargs.get("message", "")) or MagicMock(message_id=1)
-	dcb.save_schedule_state = lambda *a, **k: None
-	dcb.delete_message = lambda *a, **k: None
-	dcb.schedule_manager.get_schedule = lambda name: None
-	dcb.schedule_manager.add_schedule = lambda *a, **k: True
-	try:
-		steps = [
-			({"step": "ask_name"}, nasty),
-			({"step": "ask_cron", "name": nasty}, "<no es cron>"),
-			({"step": "ask_cron", "name": nasty}, "0 3 * * *"),
-			({"step": "ask_minutes", "name": nasty, "cron": "@daily", "action": "mute"}, "<diez>"),
-			({"step": "ask_minutes", "name": nasty, "cron": "@daily", "action": "mute"}, "-5"),
-			({"step": "ask_minutes", "name": nasty, "cron": "@daily", "action": "mute"}, "10"),
-			({"step": "ask_command", "name": nasty, "cron": "@daily", "action": "exec",
-				"container": "db<1>", "host": "h_local"}, "mysql < dump.sql > out && echo ok"),
-		]
-		for state, typed in steps:
-			before = len(sent)
-			dcb.handle_schedule_flow(1, typed, dict(state), chat_id=1)
-			assert len(sent) > before, f"{state['step']} con {typed!r} no contestó nada"
-		for i, text in enumerate(sent):
-			_assert_telegram_html(text, f"mensaje {i}")
-	finally:
-		(dcb.send_message, dcb.save_schedule_state, dcb.schedule_manager.get_schedule,
-			dcb.schedule_manager.add_schedule, dcb.delete_message) = original
-		_restore_hosts()
-
-
-def test_a_cron_that_never_fires_is_not_accepted():
-	"""
-	`0 0 30 2 *` parses — and fires on the 30th of February. It was saved,
-	never ran, and nothing said why.
-	"""
-	for never in ("0 0 30 2 *", "0 0 31 4 *", "0 0 31 6 *"):
-		assert not dcb.is_valid_cron(never), never
-	for fine in ("0 0 29 2 *", "0 0 L * *", "*/5 * * * *", "@daily", "@reboot", "0 0 * * 1#2"):
-		assert dcb.is_valid_cron(fine), fine
-	for broken in ("", "60 * * * *", "* * * *", "* * * * * *", "*/0 * * * *", "<b>", "@nunca"):
-		assert not dcb.is_valid_cron(broken), broken
 
 
 def test_the_registry_of_an_image_is_read_the_way_docker_reads_it():
@@ -3777,47 +3536,6 @@ def test_registry_tags_are_read_to_the_last_page():
 		dcb.requests.Session = original
 
 
-def test_the_three_renderers_put_the_host_in_the_same_place():
-	"""
-	The creation summary, the listing and the edit screen each build their own
-	text. With the host in a different position in each, the same task read
-	three different ways round.
-	"""
-	_with_hosts(HOST_FIXTURE, unreachable=())
-	task = {"id": 1, "name": "Limpieza", "cron": "@hourly", "action": "prune",
-			"prune_type": "images", "show_output": False, "host": "h_nas",
-			"enabled": True}
-	captured = {}
-	original = dcb.send_message
-	dcb.send_message = lambda **kwargs: captured.update(kwargs)
-	original_all = dcb.schedule_manager.get_all_schedules
-	dcb.schedule_manager.get_all_schedules = lambda: [task]
-	original_get = dcb.schedule_manager.get_schedule
-	dcb.schedule_manager.get_schedule = lambda _name: task
-	try:
-		texts = {}
-		texts["summary"] = dcb._build_schedule_summary(task)
-		dcb.show_schedule_menu(1, 1)
-		texts["listing"] = captured["message"]
-		captured.clear()
-		dcb.show_schedule_edit_options(1, "Limpieza")
-		texts["edit"] = captured.get("message", "")
-
-		prune_label = dcb.get_text("schedule_label_prune_type")
-		host_label_text = dcb.get_text("schedule_label_host")
-		output_label = dcb.get_text("schedule_label_show_output")
-		for where, text in texts.items():
-			assert host_label_text in text, (where, text)
-			positions = [text.index(prune_label), text.index(host_label_text),
-						text.index(output_label)]
-			assert positions == sorted(positions), (where, text)
-	finally:
-		dcb.send_message = original
-		dcb.schedule_manager.get_all_schedules = original_all
-		dcb.schedule_manager.get_schedule = original_get
-		_restore_hosts()
-
-
 # ---------------------------------------------------------------------------
 # Pausar un host
 
@@ -3934,594 +3652,6 @@ def test_the_local_host_cannot_be_paused():
 		_restore_hosts()
 
 
-def test_a_schedule_on_a_paused_host_is_skipped_not_disabled():
-	"""
-	The executor disables a task whose action fails, and an unreachable host
-	fails every one of them: a machine down for a week used to come back with
-	its schedules switched off one by one.
-
-	A paused host is the case where that is plainly wrong — it is coming back
-	on purpose — so its tasks are skipped and left enabled.
-	"""
-	host_registry = _paused_fixture()
-	task = {"id": 1, "name": "Reinicio nocturno", "cron": "@daily", "action": "restart",
-			"container": "plex", "host": "h_nas", "enabled": True}
-	disabled = []
-	messages = []
-	original = (dcb.schedule_manager.update_schedule, dcb.send_message)
-	dcb.schedule_manager.update_schedule = lambda name, **kwargs: disabled.append((name, kwargs))
-	dcb.send_message = lambda **kwargs: messages.append(kwargs) or None
-	try:
-		monitor = dcb.DockerScheduleMonitor()
-		assert monitor._execute_schedule_action(task) is True
-		assert disabled == [], f"la tarea se desactivó: {disabled}"
-		assert messages == [], f"la pausa no es algo que anunciar en cada vuelta: {messages}"
-	finally:
-		(dcb.schedule_manager.update_schedule, dcb.send_message) = original
-		_restore_hosts()
-
-def test_a_scheduled_prune_does_not_hold_up_the_scheduler():
-	"""
-	The loop runs every task in line, and a prune can now take minutes. One
-	that outlasted the catch-up window made the loop skip the minutes after it,
-	and their tasks with them. It goes to a worker of its own, which still runs
-	them one at a time and in order: a containers prune frees images for the
-	images one due with it.
-	"""
-	_with_hosts([HOST_FIXTURE[0]], unreachable=())
-	release = threading.Event()
-	ran, sent = [], []
-	owner = MagicMock()
-
-	def pruning(kind):
-		def prune():
-			release.wait(5)
-			ran.append(kind)
-			return (f"ok {kind}", None)
-		return prune
-
-	owner.prune_containers.side_effect = pruning("containers")
-	owner.prune_images.side_effect = pruning("images")
-	original = (dcb.manager, dcb.send_message)
-	dcb.manager = lambda host_id=None: owner
-	dcb.send_message = lambda **kw: sent.append(kw.get("message"))
-	try:
-		monitor = dcb.DockerScheduleMonitor()
-		started = time.time()
-		for kind in ("containers", "images"):
-			task = {"id": 1, "name": f"limpia {kind}", "cron": "@daily", "action": "prune",
-					"prune_type": kind, "show_output": True, "host": "h_local", "enabled": True}
-			assert monitor._execute_schedule_action(task) is True
-		assert time.time() - started < 1 and ran == [], "el bucle esperó al prune"
-
-		release.set()
-		deadline = time.time() + 5
-		while len(sent) < 2 and time.time() < deadline:
-			time.sleep(0.01)
-		assert ran == ["containers", "images"], ran
-		assert sent == ["ok containers", "ok images"], sent
-
-		# An unknown type still disables the task there and then.
-		disabled = []
-		original_update = dcb.schedule_manager.update_schedule
-		dcb.schedule_manager.update_schedule = lambda name, **kw: disabled.append(name)
-		try:
-			task = {"id": 2, "name": "rara", "cron": "@daily", "action": "prune",
-					"prune_type": "planets", "host": "h_local", "enabled": True}
-			assert monitor._execute_schedule_action(task) is False
-			assert disabled == ["rara"], disabled
-		finally:
-			dcb.schedule_manager.update_schedule = original_update
-	finally:
-		release.set()
-		dcb.manager, dcb.send_message = original
-		_restore_hosts()
-
-
-def test_a_schedule_on_an_unreachable_host_is_skipped_not_disabled():
-	"""
-	Not paused, just down for a moment: an ssh machine rebooting during the
-	nightly restart, or one still coming up when the @reboot tasks run. The
-	lookup turned "cannot ask" into "not found", and "not found" disables.
-	"""
-	_with_hosts(HOST_FIXTURE)   # nas no responde
-	disabled = []
-	messages = []
-	original = (dcb.schedule_manager.update_schedule, dcb.send_message, dcb.DockerManager.container_named)
-	dcb.schedule_manager.update_schedule = lambda name, **kwargs: disabled.append((name, kwargs))
-	dcb.send_message = lambda **kwargs: messages.append(kwargs) or None
-	try:
-		monitor = dcb.DockerScheduleMonitor()
-		for action in ("run", "stop", "restart", "exec"):
-			task = {"id": 1, "name": f"{action} nas", "cron": "@daily", "action": action,
-					"container": "plex", "host": "h_nas", "command": "ls", "enabled": True}
-			assert monitor._execute_schedule_action(task) is False
-		assert disabled == [], disabled
-		# Said once for the outage, naming the first task it cost, and not again.
-		assert [m["message"] for m in messages] == [
-			i18n.get_text("schedule_skipped_host_down", "run nas", "nas")], messages
-		messages.clear()
-
-		# A daemon that answers with an error is the same: nothing is known.
-		dcb.DockerManager.container_named = lambda self, name: (_ for _ in ()).throw(Exception("EOF"))
-		task = {"id": 2, "name": "local roto", "cron": "@daily", "action": "restart",
-				"container": "nginx", "host": "h_local", "enabled": True}
-		assert monitor._execute_schedule_action(task) is False
-		assert disabled == [], disabled
-
-		# But a host that answers "no such container" still disables, and so
-		# does a host the bot no longer has: those tasks can never run.
-		dcb.DockerManager.container_named = lambda self, name: None
-		assert monitor._execute_schedule_action(task) is False
-		task = {"id": 3, "name": "host borrado", "cron": "@daily", "action": "restart",
-				"container": "plex", "host": "h_gone", "enabled": True}
-		assert monitor._execute_schedule_action(task) is False
-		assert [name for name, _ in disabled] == ["local roto", "host borrado"], disabled
-	finally:
-		(dcb.schedule_manager.update_schedule, dcb.send_message, dcb.DockerManager.container_named) = original
-		_restore_hosts()
-
-
-def test_the_scheduler_evaluates_every_minute_exactly_once():
-	"""
-	It slept 60 s after doing the work and looked at whatever minute it landed
-	in, so every lap ran a little later and, sooner or later, one jumped from
-	:00:55 to :02:05: the task due at :01 never ran.
-	"""
-	from datetime import datetime
-	ran = []
-	tasks = [
-		{"name": "a la 1", "cron": "1 3 * * *", "action": "mute", "minutes": 1, "enabled": True},
-		{"name": "cada 5", "cron": "*/5 * * * *", "action": "mute", "minutes": 1, "enabled": True},
-		{"name": "apagada", "cron": "* * * * *", "action": "mute", "minutes": 1, "enabled": False},
-		{"name": "al arrancar", "cron": "@reboot", "action": "mute", "minutes": 1, "enabled": True},
-	]
-	original = dcb.schedule_manager.get_all_schedules
-	dcb.schedule_manager.get_all_schedules = lambda: tasks
-	try:
-		monitor = dcb.DockerScheduleMonitor()
-		monitor._execute_schedule_action = lambda task: ran.append(task["name"])
-
-		monitor._tick(datetime(2026, 10, 2, 3, 0, 55))
-		monitor._tick(datetime(2026, 10, 2, 3, 2, 5))     # se ha saltado las 3:01
-		assert ran == ["cada 5", "a la 1"], ran
-
-		ran.clear()
-		monitor._tick(datetime(2026, 10, 2, 3, 2, 40))    # el mismo minuto otra vez
-		assert ran == [], ran
-
-		# Making up several minutes runs a task once, not once per minute.
-		ran.clear()
-		monitor._tick(datetime(2026, 10, 2, 3, 6, 1))     # 3:03 a 3:06, con las 3:05
-		assert ran == ["cada 5"], ran
-
-		# The clock going back —the autumn change— does not run anything twice.
-		ran.clear()
-		monitor._tick(datetime(2026, 10, 2, 3, 5, 0))
-		assert ran == [], ran
-
-		# A gap too long to be a slow lap is not replayed: only the minute now.
-		ran.clear()
-		monitor._tick(datetime(2026, 10, 2, 9, 10, 0))
-		assert ran == ["cada 5"], ran
-	finally:
-		dcb.schedule_manager.get_all_schedules = original
-
-
-def test_reboot_tasks_run_in_the_daemon_not_when_it_is_built():
-	"""Built on the main thread: an exec that hangs held up the start of polling."""
-	ran = []
-	tasks = [{"name": "al arrancar", "cron": "@reboot", "action": "mute", "minutes": 1, "enabled": True},
-			{"name": "apagada", "cron": "@reboot", "action": "mute", "minutes": 1, "enabled": False}]
-	original = (dcb.schedule_manager.get_all_schedules, dcb.DockerScheduleMonitor._execute_schedule_action)
-	dcb.schedule_manager.get_all_schedules = lambda: tasks
-	dcb.DockerScheduleMonitor._execute_schedule_action = lambda self, task: ran.append(task["name"])
-	try:
-		monitor = dcb.DockerScheduleMonitor()
-		assert ran == [], "se ejecutó al construirlo"
-		monitor._execute_reboot_tasks()
-		assert ran == ["al arrancar"], ran
-	finally:
-		dcb.schedule_manager.get_all_schedules, dcb.DockerScheduleMonitor._execute_schedule_action = original
-
-
-def test_the_user_hears_when_a_host_whose_schedules_were_skipped_is_back():
-	"""
-	Checked every minute: a daily task would otherwise say so up to a day late.
-
-	Here only for the local host. A remote one's return is told by
-	HostAvailability, for every host, and saying it here too would be the same
-	news twice; it is still noted, so its next outage is told again.
-	"""
-	import host_registry
-	from datetime import datetime
-	_with_hosts(HOST_FIXTURE)   # nas no responde
-	messages = []
-	original = (dcb.send_message, dcb.schedule_manager.get_all_schedules, host_registry.status_snapshot)
-	dcb.send_message = lambda **kwargs: messages.append(kwargs.get("message")) or None
-	dcb.schedule_manager.get_all_schedules = lambda: []
-	try:
-		monitor = dcb.DockerScheduleMonitor()
-		monitor._down_hosts["h_nas"] = True
-		monitor._down_hosts["h_local"] = True
-		host_registry.status_snapshot = lambda entries=None, **kw: {e["id"]: (False, "down") for e in entries}
-		monitor._tick(datetime(2026, 10, 2, 3, 0))
-		assert messages == [] and set(monitor._down_hosts) == {"h_nas", "h_local"}, messages
-		host_registry.status_snapshot = lambda entries=None, **kw: {e["id"]: (True, "") for e in entries}
-		monitor._tick(datetime(2026, 10, 2, 3, 1))
-		monitor._tick(datetime(2026, 10, 2, 3, 2))
-		assert messages == [i18n.get_text("schedule_host_back", "casa")], messages
-		assert monitor._down_hosts == {}, monitor._down_hosts
-	finally:
-		(dcb.send_message, dcb.schedule_manager.get_all_schedules, host_registry.status_snapshot) = original
-		_restore_hosts()
-
-
-def test_removing_a_host_warns_about_the_schedules_it_would_orphan():
-	"""
-	A task naming a host that no longer exists raises HostUnavailable on every
-	firing, silently, for as long as its cron keeps coming round. The user has
-	to hear about it before the tap, not after.
-	"""
-	_with_hosts(HOST_FIXTURE, unreachable=())
-	tasks = [
-		{"id": 1, "name": "Limpieza nas", "cron": "@hourly", "action": "prune",
-			"prune_type": "images", "host": "h_nas", "enabled": True},
-		{"id": 2, "name": "Reinicio local", "cron": "@daily", "action": "restart",
-			"container": "nginx", "host": "h_local", "enabled": True},
-		{"id": 3, "name": "Silencio", "cron": "@daily", "action": "mute",
-			"minutes": 60, "enabled": True},
-		{"id": 4, "name": "Apagada", "cron": "@daily", "action": "stop",
-			"container": "plex", "host": "h_nas", "enabled": False},
-	]
-	original = dcb.schedule_manager.get_all_schedules
-	dcb.schedule_manager.get_all_schedules = lambda: tasks
-	try:
-		affected = [t["name"] for t in dcb.schedules_on_host("h_nas")]
-		# Only the ones that would break: another host's task is not affected,
-		# a mute belongs to no machine, and a disabled task was not running.
-		assert affected == ["Limpieza nas"], affected
-
-		text, _markup = dcb.build_settings_host_remove("h_nas")
-		assert "Limpieza nas" in text, text
-		assert "Reinicio local" not in text, text
-		assert "Silencio" not in text, text
-	finally:
-		dcb.schedule_manager.get_all_schedules = original
-		_restore_hosts()
-
-
-def test_a_task_created_before_hosts_existed_counts_as_local():
-	"""It carries no host and means the machine it was set up on."""
-	_with_hosts(HOST_FIXTURE, unreachable=())
-	tasks = [{"id": 1, "name": "Vieja", "cron": "@daily", "action": "restart",
-				"container": "nginx", "enabled": True}]
-	original = dcb.schedule_manager.get_all_schedules
-	dcb.schedule_manager.get_all_schedules = lambda: tasks
-	try:
-		assert [t["name"] for t in dcb.schedules_on_host("h_local")] == ["Vieja"]
-		assert dcb.schedules_on_host("h_nas") == []
-	finally:
-		dcb.schedule_manager.get_all_schedules = original
-		_restore_hosts()
-
-
-def test_orphaned_schedules_are_disabled_and_not_deleted():
-	"""
-	Moving them to another host and switching them back on is a couple of
-	taps; a deleted cron expression is gone for good. Same choice the executor
-	already makes with a task it cannot run.
-	"""
-	tasks = [{"id": 1, "name": "Limpieza nas", "cron": "@hourly", "action": "prune",
-				"prune_type": "images", "host": "h_nas", "enabled": True}]
-	updates = []
-	original = dcb.schedule_manager.update_schedule
-	dcb.schedule_manager.update_schedule = lambda name, **kw: (
-		updates.append((name, kw)) or True)
-	original_delete = dcb.schedule_manager.delete_schedule
-	deleted = []
-	dcb.schedule_manager.delete_schedule = lambda name: deleted.append(name)
-	try:
-		assert dcb.disable_schedules(tasks) == ["Limpieza nas"]
-		assert updates == [("Limpieza nas", {"enabled": False})], updates
-		assert deleted == [], deleted
-	finally:
-		dcb.schedule_manager.update_schedule = original
-		dcb.schedule_manager.delete_schedule = original_delete
-
-
-def _orphaned_prune_task(**overrides):
-	"""A prune left behind by removing `nas`: only the local host remains."""
-	task = {"id": 9, "name": "Limpieza nas", "cron": "@hourly", "action": "prune",
-			"prune_type": "images", "show_output": False, "host": "h_nas",
-			"enabled": False}
-	task.update(overrides)
-	return task
-
-
-def _orphaned_restart_task(**overrides):
-	"""The same, for a task that names a container."""
-	return _orphaned_prune_task(action="restart", container="plex", prune_type=None, **overrides)
-
-
-def _patch_schedules(task):
-	"""
-	Serves `task` as the only schedule and records what is sent and saved.
-
-	The edit state is captured too: the shared module would otherwise keep a
-	pending edit for user 1 into whichever test runs next.
-	"""
-	sent, markups, updates = [], [], []
-	original = (dcb.send_message, dcb.save_schedule_state, dcb.schedule_manager.get_all_schedules,
-				dcb.schedule_manager.get_schedule, dcb.schedule_manager.get_schedule_by_id,
-				dcb.schedule_manager.update_schedule)
-
-	def send(**kwargs):
-		sent.append(kwargs.get("message", ""))
-		markups.append(kwargs.get("reply_markup"))
-		return MagicMock(message_id=1)
-
-	def update(name, **kwargs):
-		updates.append((name, kwargs))
-		task.update(kwargs)
-		return True
-
-	dcb.send_message = send
-	dcb.save_schedule_state = lambda *_a, **_k: None
-	dcb.schedule_manager.get_all_schedules = lambda: [task]
-	dcb.schedule_manager.get_schedule = lambda _name: task
-	dcb.schedule_manager.get_schedule_by_id = lambda _id: task
-	dcb.schedule_manager.update_schedule = update
-
-	def restore():
-		(dcb.send_message, dcb.save_schedule_state, dcb.schedule_manager.get_all_schedules,
-			dcb.schedule_manager.get_schedule, dcb.schedule_manager.get_schedule_by_id,
-			dcb.schedule_manager.update_schedule) = original
-
-	return sent, markups, updates, restore
-
-
-def test_a_schedule_on_a_removed_host_is_disabled_and_says_why():
-	"""
-	A prune went to manager() and was skipped as a host not answering, on every
-	firing, naming the bare id of a host that was never coming back. A
-	container task was disabled, but the notice only said it had failed.
-	"""
-	_with_hosts([HOST_FIXTURE[0]], unreachable=())
-	disabled, messages, asked = [], [], []
-	original = (dcb.schedule_manager.update_schedule, dcb.send_message, dcb.manager)
-	dcb.schedule_manager.update_schedule = lambda name, **kwargs: disabled.append((name, kwargs))
-	dcb.send_message = lambda **kwargs: messages.append(kwargs.get("message"))
-	dcb.manager = lambda host_id=None: asked.append(host_id)
-	try:
-		monitor = dcb.DockerScheduleMonitor()
-		for task in (_orphaned_prune_task(enabled=True), _orphaned_restart_task(enabled=True)):
-			messages.clear()
-			assert monitor._execute_schedule_action(task) is False
-			assert messages == [dcb.get_text("schedule_disabled_host_missing", "Limpieza nas")], messages
-		assert disabled == [("Limpieza nas", {"enabled": False})] * 2, disabled
-		assert asked == [], asked
-		assert "h_nas" not in monitor._down_hosts
-	finally:
-		(dcb.schedule_manager.update_schedule, dcb.send_message, dcb.manager) = original
-		_restore_hosts()
-
-def test_a_task_on_a_removed_host_says_so_even_with_one_host_left():
-	"""
-	With a single host the host line is hidden, which is exactly the state the
-	removal leaves behind: the task looked runnable and named nothing, or the
-	bare id of a host that is gone.
-	"""
-	_with_hosts([HOST_FIXTURE[0]], unreachable=())
-	task = _orphaned_prune_task()
-	sent, markups, _updates, restore = _patch_schedules(task)
-	try:
-		dcb.show_schedule_menu(1, 1)
-		dcb.show_schedule_edit_options(1, task["name"])
-		missing = dcb.get_text("schedule_host_missing")
-		for text in sent:
-			assert missing in text, text
-			assert "h_nas" not in text, text
-		assert "scheduleEditField|host|9" in harness.keyboard_callbacks(markups[-1])
-	finally:
-		restore()
-		_restore_hosts()
-
-
-def test_a_prune_offers_its_host_with_several_hosts():
-	"""The everyday case: moving a cleanup from one machine to another."""
-	_with_hosts(HOST_FIXTURE, unreachable=())
-	task = _orphaned_prune_task(enabled=True)
-	sent, markups, _updates, restore = _patch_schedules(task)
-	try:
-		dcb.show_schedule_edit_options(1, task["name"])
-		assert "scheduleEditField|host|9" in harness.keyboard_callbacks(markups[-1])
-		assert dcb.get_text("schedule_host_missing") not in sent[-1], sent[-1]
-		assert "<b>nas</b>" in sent[-1], sent[-1]
-	finally:
-		restore()
-		_restore_hosts()
-
-
-def test_a_container_task_moves_host_only_with_its_container():
-	"""
-	No host button, not even when its host is gone: the name only means
-	something on one machine, and "Container" already moves both.
-	"""
-	_with_hosts([HOST_FIXTURE[0]], unreachable=())
-	task = _orphaned_restart_task()
-	sent, markups, updates, restore = _patch_schedules(task)
-	try:
-		dcb.show_schedule_edit_options(1, task["name"])
-		callbacks_found = harness.keyboard_callbacks(markups[-1])
-		assert "scheduleEditField|host|9" not in callbacks_found, callbacks_found
-		assert "scheduleEditField|container|9" in callbacks_found, callbacks_found
-		assert dcb.get_text("schedule_host_missing") in sent[-1], sent[-1]
-
-		# Nor from a button pressed anyway: the host would move without it.
-		callbacks.cb_scheduleEditValue(_update_ctx("scheduleEditValue", 1, 2,
-			field="host", scheduleId="9", value="h_local"))
-		assert updates == [], updates
-	finally:
-		restore()
-		_restore_hosts()
-
-
-def test_a_prune_can_be_moved_to_another_host():
-	"""
-	A prune names no container, so changing the container cannot move it the
-	way it moves a container task. Without its own field it could only be
-	deleted once its host was removed.
-	"""
-	_with_hosts([HOST_FIXTURE[0]], unreachable=())
-	task = _orphaned_prune_task()
-	sent, markups, updates, restore = _patch_schedules(task)
-	try:
-		callbacks.cb_scheduleEditField(_update_ctx("scheduleEditField", 1, 2,
-			field="host", scheduleId="9"))
-		assert harness.keyboard_callbacks(markups[-1]) == [
-			"scheduleEditValue|host|9|h_local", "scheduleCancel"], markups[-1]
-		assert dcb.get_text("schedule_host_missing") in sent[-1], sent[-1]
-		callbacks.cb_scheduleEditValue(_update_ctx("scheduleEditValue", 1, 2,
-			field="host", scheduleId="9", value="h_local"))
-		assert updates == [("Limpieza nas", {"host": "h_local"})], updates
-		assert not dcb.schedule_host_missing(task)
-		# Moved, not switched on: that is still the user's call.
-		assert task["enabled"] is False
-	finally:
-		restore()
-		_restore_hosts()
-
-
-def test_the_host_picker_leaves_out_a_paused_host():
-	"""Same list as creating a prune: a paused host is not one to move to."""
-	_paused_fixture()
-	task = _orphaned_prune_task(host="h_local")
-	_sent, markups, _updates, restore = _patch_schedules(task)
-	try:
-		callbacks.cb_scheduleEditField(_update_ctx("scheduleEditField", 1, 2,
-			field="host", scheduleId="9"))
-		assert harness.keyboard_callbacks(markups[-1]) == [
-			"scheduleEditValue|host|9|h_local", "scheduleCancel"], markups[-1]
-	finally:
-		restore()
-		_restore_hosts()
-
-
-def test_a_stale_host_button_does_not_move_the_task():
-	"""A host removed after the list was drawn would leave it where it cannot run."""
-	_with_hosts([HOST_FIXTURE[0]], unreachable=())
-	task = _orphaned_prune_task(host="h_local")
-	_sent, _markups, updates, restore = _patch_schedules(task)
-	try:
-		callbacks.cb_scheduleEditValue(_update_ctx("scheduleEditValue", 1, 2,
-			field="host", scheduleId="9", value="h_nas"))
-		assert updates == [], updates
-	finally:
-		restore()
-		_restore_hosts()
-
-
-def test_a_prune_with_a_single_healthy_host_offers_no_host_button():
-	"""Nowhere to move it to: the screen reads as it did before hosts existed."""
-	_with_hosts([HOST_FIXTURE[0]], unreachable=())
-	task = _orphaned_prune_task(host="h_local")
-	_sent, markups, _updates, restore = _patch_schedules(task)
-	try:
-		dcb.show_schedule_edit_options(1, task["name"])
-		assert "scheduleEditField|host|9" not in harness.keyboard_callbacks(markups[-1])
-	finally:
-		restore()
-		_restore_hosts()
-
-
-def test_only_a_removed_host_counts_as_missing():
-	"""
-	A task with no host means the local one, and a paused host is still there:
-	neither is stopped from being switched on.
-	"""
-	_paused_fixture()
-	try:
-		legacy = _orphaned_prune_task()
-		del legacy["host"]
-		assert not dcb.schedule_host_missing(legacy)
-		assert not dcb.schedule_host_missing(_orphaned_prune_task())  # nas, paused
-		assert not dcb.schedule_host_missing(_orphaned_restart_task())
-		assert not dcb.schedule_host_missing(
-			{"id": 9, "name": "Silencio", "action": "mute", "minutes": 60, "host": "h_gone"})
-		assert dcb.schedule_host_missing(_orphaned_prune_task(host="h_gone"))
-	finally:
-		_restore_hosts()
-
-
-def test_a_task_on_a_removed_host_cannot_be_switched_on():
-	"""
-	Its next firing would switch it straight back off. It has to be moved
-	first, so the refusal says how for each kind of task and the edit screen
-	comes back with the button that does it.
-	"""
-	_with_hosts([HOST_FIXTURE[0]], unreachable=())
-	cases = [
-		(_orphaned_prune_task(), "schedule_enable_host_missing_prune", "scheduleEditField|host|9"),
-		(_orphaned_restart_task(), "schedule_enable_host_missing_container",
-			"scheduleEditField|container|9"),
-	]
-	try:
-		for task, key, fix in cases:
-			sent, markups, updates, restore = _patch_schedules(task)
-			try:
-				callbacks.cb_scheduleEditStatus(_update_ctx("scheduleEditStatus", 1, 2, scheduleId="9"))
-				assert updates == [], updates
-				assert sent[0] == dcb.get_text(key, "Limpieza nas"), sent
-				assert fix in harness.keyboard_callbacks(markups[1]), markups[1]
-			finally:
-				restore()
-
-		# Switching one off is never refused, and a moved one switches on.
-		task = _orphaned_prune_task(enabled=True)
-		_sent, _markups, updates, restore = _patch_schedules(task)
-		try:
-			callbacks.cb_scheduleEditStatus(_update_ctx("scheduleEditStatus", 1, 2, scheduleId="9"))
-			task["host"] = "h_local"
-			callbacks.cb_scheduleEditStatus(_update_ctx("scheduleEditStatus", 1, 2, scheduleId="9"))
-			assert [kw for _name, kw in updates] == [{"enabled": False}, {"enabled": True}], updates
-		finally:
-			restore()
-	finally:
-		_restore_hosts()
-
-def test_a_mute_task_belongs_to_no_host():
-	"""
-	Muting silences the bot's own notifications. Showing it a host would be
-	claiming something that means nothing, and the first version of this
-	stamped one onto every task alike.
-	"""
-	_with_hosts(HOST_FIXTURE, unreachable=())
-	original = dcb.send_message
-	dcb.send_message = lambda *a, **kw: None
-	original_save = dcb.save_schedule_state
-	dcb.save_schedule_state = lambda *a, **k: None
-	try:
-		# Even with one stored, the summary does not show it.
-		summary = dcb._build_schedule_summary(
-			{"name": "silencio", "action": "mute", "minutes": 30, "host": "h_nas"})
-		assert dcb.get_text("schedule_label_host") not in summary, summary
-
-		# And confirming clears it rather than pinning the local one.
-		state = {"name": "silencio", "action": "mute", "minutes": 30}
-		dcb.confirm_schedule_creation(1, state)
-		assert state["host"] is None, state
-
-		# While a task that does act on Docker still gets one.
-		state = {"name": "limpieza", "action": "prune", "prune_type": "images"}
-		dcb.confirm_schedule_creation(1, state)
-		assert state["host"] == "h_local", state
-	finally:
-		dcb.send_message = original
-		dcb.save_schedule_state = original_save
-		_restore_hosts()
-
-
 def test_every_schedule_action_explains_itself_in_the_users_language():
 	"""
 	The picker used to hardcode six buttons reading `run`, `stop`, `restart`...
@@ -4534,150 +3664,6 @@ def test_every_schedule_action_explains_itself_in_the_users_language():
 		keys = i18n.load_locale(locale)
 		for action in dcb.SCHEDULE_ACTIONS:
 			assert f"schedule_action_{action}" in keys, (locale, action)
-
-
-def test_the_action_picker_offers_exactly_the_actions_it_explains():
-	"""One list, so the buttons and the legend cannot drift apart again."""
-	captured = {}
-	original = dcb.send_message
-	dcb.send_message = lambda message="", reply_markup=None, **kw: captured.update(
-		message=message, reply_markup=reply_markup) or None
-	original_state = dcb.save_schedule_state
-	dcb.save_schedule_state = lambda *a, **k: None
-	try:
-		dcb.handle_schedule_flow(1, "0 0 * * *", {"step": "ask_cron", "name": "prueba"})
-		text = captured.get("message", "")
-		markup = captured.get("reply_markup")
-		offered = [c.split("|", 1)[1] for c in harness.keyboard_callbacks(markup)
-					if c.startswith("scheduleSelectAction|")]
-		assert offered == list(dcb.SCHEDULE_ACTIONS), offered
-		for action in dcb.SCHEDULE_ACTIONS:
-			assert i18n.get_text(f"schedule_action_{action}") in text, action
-	finally:
-		dcb.send_message = original
-		dcb.save_schedule_state = original_state
-
-
-def test_every_schedule_action_is_classified():
-	"""
-	A new action missing from the set would silently be treated as belonging
-	to no host, and its task would run wherever the executor guessed.
-	"""
-	from config import HOST_SCOPED_SCHEDULE_ACTIONS, SCHEDULE_PATTERNS
-
-	unclassified = set(SCHEDULE_PATTERNS) - HOST_SCOPED_SCHEDULE_ACTIONS - {"mute"}
-	assert not unclassified, f"acciones sin clasificar: {sorted(unclassified)}"
-	assert HOST_SCOPED_SCHEDULE_ACTIONS <= set(SCHEDULE_PATTERNS)
-
-
-def test_the_flow_asks_in_the_order_the_summary_lists():
-	"""
-	So the summary only grows downwards as the answers come in and the last
-	thing answered is the last line, instead of appearing in the middle.
-	"""
-	order = ["name", "cron", "action", "container", "minutes", "prune_type",
-			"host", "show_output", "command"]
-	state = {key: "x" for key in order}
-	state["action"] = "prune"
-	state["show_output"] = True
-	_with_hosts(HOST_FIXTURE, unreachable=())
-	try:
-		summary = dcb._build_schedule_summary(state)
-		labels = [
-			("prune_type", dcb.get_text("schedule_label_prune_type")),
-			("host", dcb.get_text("schedule_label_host")),
-			("show_output", dcb.get_text("schedule_label_show_output")),
-		]
-		positions = [summary.index(label) for _, label in labels]
-		assert positions == sorted(positions), summary
-	finally:
-		_restore_hosts()
-
-
-def test_a_scheduled_prune_is_asked_which_host():
-	"""
-	It picks no container, so nothing else in the flow would say where it runs.
-	Interactive /prune asks the machine before the object type; this follows it
-	for the same reason: it deletes things.
-	"""
-	_with_hosts(HOST_FIXTURE, unreachable=())
-	captured = {}
-	original = dcb.send_message
-	dcb.send_message = lambda **kwargs: captured.update(kwargs)
-	original_save = dcb.save_schedule_state
-	dcb.save_schedule_state = lambda *a, **k: None
-	try:
-		dcb.ask_schedule_prune_host(1, {"name": "nightly", "action": "prune"})
-		callbacks = harness.keyboard_callbacks(captured["reply_markup"])
-		assert "scheduleSelectHost|h_local" in callbacks, callbacks
-		assert "scheduleSelectHost|h_nas" in callbacks, callbacks
-		for data in callbacks:
-			callback_registry.parse(data)
-	finally:
-		dcb.send_message = original
-		dcb.save_schedule_state = original_save
-		_restore_hosts()
-
-
-def test_the_prune_type_step_offers_the_four_kinds():
-	captured = {}
-	original = dcb.send_message
-	dcb.send_message = lambda **kwargs: captured.update(kwargs)
-	original_save = dcb.save_schedule_state
-	dcb.save_schedule_state = lambda *a, **k: None
-	try:
-		dcb.ask_schedule_prune_type(1, {"name": "nightly", "action": "prune"})
-		callbacks = harness.keyboard_callbacks(captured["reply_markup"])
-		for kind in ("containers", "images", "networks", "volumes"):
-			assert f"scheduleSelectPruneType|{kind}" in callbacks, callbacks
-	finally:
-		dcb.send_message = original
-		dcb.save_schedule_state = original_save
-
-
-def test_a_task_always_ends_up_with_a_host():
-	"""
-	Confirming records the local host when nothing asked for one, so the
-	executor never has to guess.
-	"""
-	_with_hosts([HOST_FIXTURE[0]], unreachable=())
-	state = {"name": "nightly", "action": "prune", "prune_type": "images"}
-	original = dcb.send_message
-	dcb.send_message = lambda **kwargs: None
-	original_save = dcb.save_schedule_state
-	dcb.save_schedule_state = lambda *a, **k: None
-	try:
-		dcb.confirm_schedule_creation(1, state)
-		assert state["host"] == "h_local", state
-	finally:
-		dcb.send_message = original
-		dcb.save_schedule_state = original_save
-		_restore_hosts()
-
-
-def test_the_schedule_summary_says_which_machine():
-	"""
-	A prune task picks no container, so nothing implies its host. Leaving it
-	blank and falling back silently is what this avoids.
-	"""
-	_with_hosts(HOST_FIXTURE, unreachable=())
-	try:
-		summary = dcb._build_schedule_summary(
-			{"name": "nightly", "action": "prune", "prune_type": "images", "host": "h_nas"})
-		assert "nas" in summary, summary
-
-		# Not defaulted: the step that asks for the host renders this summary
-		# above the question, and a fallback would claim one while still asking.
-		asking = dcb._build_schedule_summary({"name": "nightly", "action": "prune"})
-		assert dcb.get_text("schedule_label_host") not in asking, asking
-
-		# With one host the summary reads as it always did.
-		_with_hosts([HOST_FIXTURE[0]], unreachable=())
-		summary = dcb._build_schedule_summary(
-			{"name": "nightly", "action": "prune", "prune_type": "images"})
-		assert "casa" not in summary, summary
-	finally:
-		_restore_hosts()
 
 
 def test_the_start_header_counts_every_host():
@@ -4760,12 +3746,13 @@ def test_a_prune_that_fails_says_so_instead_of_raising():
 		getattr(owner.client, collection).prune.side_effect = busy
 	try:
 		for kind in ("containers", "images", "networks", "volumes"):
-			message, details = getattr(owner, f"prune_{kind}")()
+			message, details, cleaned = getattr(owner, f"prune_{kind}")()
 			assert details is None and message == i18n.get_text(f"error_prune_{kind}"), kind
 		owner.client.images.prune.side_effect = None
 		owner.client.images.prune.return_value = {"ImagesDeleted": None}
-		message, details = owner.prune_images()
+		message, details, cleaned = owner.prune_images()
 		assert details is not None and "0.0B" in message, message
+		assert cleaned is False, "no ha borrado nada"
 	finally:
 		host_registry.slow_client = original_slow
 		_restore_hosts()
@@ -4776,7 +3763,7 @@ def test_a_prune_that_fails_says_so_instead_of_raising():
 	sent, documents, steps = [], [], []
 	original = (dcb.manager, dcb.send_message, dcb.send_document, dcb.delete_message)
 	failing = MagicMock()
-	failing.prune_images.side_effect = lambda: steps.append("prune") or ("falló", None)
+	failing.prune_images.side_effect = lambda: steps.append("prune") or ("falló", None, False)
 	dcb.manager = lambda host_id=None: failing
 
 	def sending(**kw):
@@ -4826,14 +3813,14 @@ def test_a_prune_runs_with_the_slow_client_and_says_when_it_ran_out_of_time():
 	host_registry.slow_client = lambda host_id: slow
 	try:
 		slow.images.prune.return_value = {"SpaceReclaimed": 1024}
-		message, details = owner.prune_images()
-		assert details is not None, message
+		message, details, cleaned = owner.prune_images()
+		assert details is not None and cleaned, message
 		slow.images.prune.assert_called_once_with(filters={'dangling': False})
 		owner.client.images.prune.assert_not_called()
 
 		slow.images.prune.side_effect = requests.exceptions.ReadTimeout(
 			"UnixHTTPConnectionPool(host='localhost', port=None): Read timed out. (read timeout=600)")
-		message, details = owner.prune_images()
+		message, details, cleaned = owner.prune_images()
 		minutes = str(host_registry.SLOW_TIMEOUT_SECONDS // 60)
 		assert details is None, message
 		assert message == i18n.get_text("error_prune_timeout", minutes, "docker image prune -a -f"), message
@@ -4845,7 +3832,7 @@ def test_a_prune_runs_with_the_slow_client_and_says_when_it_ran_out_of_time():
 		slow.images.prune.side_effect = docker.errors.APIError(
 			"409 Client Error: Conflict", response=response,
 			explanation="a prune operation is already running")
-		message, details = owner.prune_images()
+		message, details, cleaned = owner.prune_images()
 		assert details is None and message == i18n.get_text("error_prune_busy"), message
 	finally:
 		host_registry.slow_client = original_slow
@@ -5338,7 +4325,7 @@ def test_nothing_answers_a_callback_without_the_guard():
 	abort a press the next time the network hiccups.
 	"""
 	for filename in ("core.py", "callbacks.py", "commands.py"):
-		source = io.open(os.path.join(harness.REPO, filename), encoding="utf-8").read()
+		source = io.open(os.path.join(harness.SRC, filename), encoding="utf-8").read()
 		for line_number, line in enumerate(source.split("\n"), start=1):
 			if "answer_callback_query(" in line and "def " not in line:
 				assert "answer_callback_quietly" in line or "bot.answer_callback_query(callback_id" in line, \
@@ -5422,11 +4409,16 @@ def test_the_registry_matches_4_2_0_exactly():
 	registry = callback_registry.specs()
 	for name in baseline["_dead_in_4_2_0"]:
 		assert name not in registry, f"{name} era una declaración muerta"
+	removed = set(baseline["_removed_after_4_2_0"])
+	for name in removed:
+		assert name not in registry, f"{name} se quitó a propósito y ha vuelto"
 
-	missing = set(baseline["callbacks"]) - set(registry)
+	missing = set(baseline["callbacks"]) - set(registry) - removed
 	assert not missing, f"callbacks de 4.2.0 perdidos: {sorted(missing)}"
 
 	for name, expected in sorted(baseline["callbacks"].items()):
+		if name in removed:
+			continue
 		spec = registry[name]
 		assert list(spec.params) == expected["params"], f"{name}: params"
 		assert spec.keeps_message == expected["keeps_message"], f"{name}: keeps_message"
@@ -5591,20 +4583,13 @@ def test_a_translation_keeps_the_markup_of_the_original():
 
 def test_the_cron_examples_survive_in_every_language():
 	"""
-	The specific thing the markup check found, pinned on its own: this string
-	is the only help the user gets on cron syntax, and an example without its
-	asterisks teaches the wrong format.
+	The specific thing the markup check found, pinned on its own: the
+	question that asks for the cron is the help the user gets on its syntax,
+	and an example without its asterisks teaches the wrong format.
 	"""
-	base = i18n.load_locale("es")["error_adding_schedule"]
-	expected = base.count("*")
-	assert expected >= 9, "el original ya no lleva ejemplos de cron"
 	for locale in _locale_names():
-		text = i18n.load_locale(locale)["error_adding_schedule"]
-		assert text.count("*") == expected, (
-			f"{locale}: el ejemplo de cron lleva {text.count('*')} asteriscos "
-			f"en vez de {expected}")
-		assert "<b>" not in text, (
-			f"{locale}: los asteriscos del cron se han vuelto <b> otra vez")
+		text = i18n.load_locale(locale)["schedule_ask_cron"]
+		assert "'0 0 * * *'" in text, f"{locale}: el ejemplo de cron ha perdido sus asteriscos"
 
 
 def _batch_stubs(results, extended=False, own=(), current=()):
@@ -5964,6 +4949,36 @@ def test_confirming_finds_a_container_recreated_since_the_list_was_sent():
 	finally:
 		(dcb.update_containers, dcb.find_container, dcb.find_container_id_on_host, dcb.update_available) = original
 		dcb.clear_update_data(7, 70)
+
+
+def test_confirming_does_not_update_another_container_that_shares_the_id_prefix():
+	"""
+	The list keeps five characters of each ID. With the listed container
+	recreated since —Watchtower, compose up—, another whose ID starts the
+	same was all the reference found, and confirming updated that one. It
+	counts only with the listed name: the listed one is looked for by it,
+	updated if it came back with another ID, and reported missing if not.
+	"""
+	ref = dcb.make_ref("h_local", "ff2e3")
+	other, plex = _container("c1015", "running"), _container("plex", "running")
+	other.id, plex.id = "ff2e3" + "1" * 59, "beef0" + "0" * 59
+	live = {ref: other, dcb.make_ref("h_local", "beef0"): plex}
+	batches = []
+	original = (dcb.update_containers, dcb.find_container, dcb.find_container_id_on_host, dcb.update_available)
+	dcb.update_containers = lambda targets, **kw: batches.append((targets, kw))
+	dcb.find_container = lambda r: (MagicMock(host_id="h_local"), live[r]) if r in live else (None, None)
+	dcb.update_available = lambda container, host_id: True
+	try:
+		for recreated, expected in ((False, ([], {"up_to_date": [], "missing": [("h_local", "plex")]})),
+									(True, ([(dcb.make_ref("h_local", "beef0"), "plex")], {"up_to_date": [], "missing": []}))):
+			batches.clear()
+			dcb.find_container_id_on_host = lambda host_id, name: "beef0" if recreated and name == "plex" else None
+			dcb.save_update_data(8, 80, [[ref, "plex"]], {ref})
+			callbacks.cb_updateSelected(_update_ctx("updateSelected", 8, 81, originalMessageId="80"))
+			assert batches == [expected], (recreated, batches)
+	finally:
+		(dcb.update_containers, dcb.find_container, dcb.find_container_id_on_host, dcb.update_available) = original
+		dcb.clear_update_data(8, 80)
 
 
 def test_an_update_list_that_expired_says_so():
@@ -6434,8 +5449,8 @@ def test_every_question_answered_by_typing_goes_through_typed_prompt():
 	"""
 	typed = ("schedule_ask_name", "schedule_ask_cron", "schedule_ask_minutes",
 			"schedule_ask_command", "prompt_enter_command", "ports_ask_port")
-	for filename in ("core.py", "callbacks.py"):
-		source = io.open(os.path.join(harness.REPO, filename), encoding="utf-8").read()
+	for filename in ("core.py", "callbacks.py", "schedules.py"):
+		source = io.open(os.path.join(harness.SRC, filename), encoding="utf-8").read()
 		for key in typed:
 			assert not re.search(r"get_text\(\s*['\"]" + key + r"['\"]", source), (filename, key)
 
@@ -6650,50 +5665,6 @@ def test_a_monitor_told_to_retry_stops_waiting():
 # Lo que arregla la revisión de la 5.1.1
 # ---------------------------------------------------------------------------
 
-def test_cancelling_a_schedule_question_forgets_it():
-	"""
-	Cancel was `cerrar`, which leaves the per-user state alone: the admin's
-	next loose message, hours later, became the command of an exec task.
-	"""
-	dcb.save_schedule_state(77, {"schedule_name": "dump", "schedule_id": 3, "field": "command"})
-	try:
-		callbacks.cb_scheduleCancel(_update_ctx("scheduleCancel", 77, 2, userId=77))
-		assert dcb.load_schedule_state(77) is None
-	finally:
-		dcb.clear_schedule_state(77)
-
-
-def test_a_value_picked_with_a_button_closes_the_question():
-	"""The question answered by a button stayed open, and swallowed the next text."""
-	task = _orphaned_prune_task(host="h_local")
-	sent, _markups, updates, restore = _patch_schedules(task)
-	original_menu = dcb.show_schedule_menu
-	dcb.show_schedule_menu = lambda *a, **k: None
-	try:
-		dcb.write_cache_item("schedule_state_1", {"schedule_name": task["name"], "schedule_id": 9, "field": "prune_type"})
-		callbacks.cb_scheduleEditValue(_update_ctx("scheduleEditValue", 1, 2,
-			field="prune_type", scheduleId="9", value="volumes"))
-		assert updates == [(task["name"], {"prune_type": "volumes"})], updates
-		assert dcb.load_schedule_state(1) is None
-	finally:
-		dcb.show_schedule_menu = original_menu
-		dcb.clear_schedule_state(1)
-		restore()
-
-
-def test_text_while_a_schedule_waits_for_a_button_is_left_alone():
-	"""Deleted before, every message the admin wrote, until the question was answered."""
-	deleted = []
-	original = dcb.delete_message
-	dcb.delete_message = lambda message_id, chat_id=None: deleted.append(message_id)
-	try:
-		dcb.handle_schedule_flow(1, "hola", {"field": "prune_type", "schedule_name": "x"}, 5, 99)
-		dcb.handle_schedule_flow(1, "hola", {"step": "ask_action"}, 5, 98)
-		assert deleted == [], deleted
-	finally:
-		dcb.delete_message = original
-
-
 def test_a_pending_question_is_answered_only_where_and_while_it_was_asked():
 	"""A loose message, days later and in another chat, used to answer it."""
 	state = {"asked_in": "555", "asked_at": time.time()}
@@ -6739,7 +5710,7 @@ def test_a_typed_exec_says_it_is_still_running_instead_of_holding_the_worker():
 	release = threading.Event()
 	sent = []
 	owner = MagicMock()
-	owner.execute_command = lambda **kw: release.wait(5) and "pong"
+	owner.execute_command = lambda **kw: release.wait(5) and ("pong", 0)
 	original = (dcb.manager_for, dcb.send_message, dcb.EXEC_WAIT_SECONDS)
 	dcb.manager_for = lambda ref: owner
 	dcb.send_message = lambda **kw: sent.append(kw.get("message", "")) or MagicMock()
@@ -6764,7 +5735,7 @@ def test_a_scheduled_exec_does_not_wait_for_the_command():
 	"""Run in the scheduler's thread, a long one made it skip the minutes after it."""
 	release = threading.Event()
 	owner = MagicMock()
-	owner.execute_command = lambda **kw: release.wait(5) and "ok"
+	owner.execute_command = lambda **kw: release.wait(5) and ("ok", 0)
 	original = (dcb.manager_for, dcb.send_message)
 	dcb.manager_for = lambda ref: owner
 	dcb.send_message = lambda **kw: MagicMock()
@@ -6784,12 +5755,90 @@ def test_long_exec_output_goes_as_a_file():
 	dcb.send_message = lambda **kw: sent.append(kw.get("message", "")) or MagicMock()
 	dcb.send_document = lambda **kw: documents.append(kw) or MagicMock()
 	try:
-		dcb._send_exec_result("h_local:abc12", "web", "cat big.log", "x" * 20000)
+		dcb._send_exec_result("h_local:abc12", "web", "cat big.log", ("x" * 20000, 0))
 		assert len(sent) == 1 and len(documents) == 1, (len(sent), len(documents))
 		dcb._send_exec_result("h_local:abc12", "web", "false", None)
 		assert i18n.get_text("error_executing_command_container", "false", "web") in sent[-1]
 	finally:
 		dcb.send_message, dcb.send_document = original
+
+
+def test_an_exec_set_to_failures_only_speaks_when_there_is_something_to_say():
+	"""
+	A check run every few minutes that prints nothing when all is well sent a
+	"ran correctly" each time. In that mode a clean, silent run says nothing;
+	a failure or any output still does, and a failure without output no
+	longer reads as "ran correctly".
+	"""
+	sent, documents = [], []
+	original = (dcb.send_message, dcb.send_document)
+	dcb.send_message = lambda **kw: sent.append(kw.get("message", "")) or MagicMock()
+	dcb.send_document = lambda **kw: documents.append(kw) or MagicMock()
+	ok = i18n.get_text("command_executed_without_output")
+	try:
+		for quiet in (("", 0), ("  \n", 0), ("", None)):
+			dcb._send_exec_result("h_local:abc12", "web", "check.sh", quiet, only_failures=True)
+		assert sent == [], sent
+
+		dcb._send_exec_result("h_local:abc12", "web", "check.sh", ("", 1), only_failures=True)
+		assert ok not in sent[-1] and i18n.get_text("exec_no_output") in sent[-1], sent[-1]
+		assert i18n.get_text("exec_exit_code", "1") in sent[-1], sent[-1]
+
+		dcb._send_exec_result("h_local:abc12", "web", "check.sh", ("disco al 95%", 0), only_failures=True)
+		assert "disco al 95%" in sent[-1] and i18n.get_text("exec_exit_code", "0") not in sent[-1], sent[-1]
+
+		dcb._send_exec_result("h_local:abc12", "web", "check.sh", None, only_failures=True)
+		assert i18n.get_text("error_executing_command_container", "check.sh", "web") in sent[-1]
+
+		# A typed /exec says how it ended, and a failure with its code.
+		sent.clear()
+		dcb._send_exec_result("h_local:abc12", "web", "true", ("", 0))
+		dcb._send_exec_result("h_local:abc12", "web", "grep x f", ("grep: f: No such file", 2))
+		assert ok in sent[0] and i18n.get_text("exec_exit_code", "0") not in sent[0], sent[0]
+		assert i18n.get_text("exec_exit_code", "2") in sent[1], sent[1]
+		assert documents == []
+	finally:
+		dcb.send_message, dcb.send_document = original
+
+
+def test_the_manager_hands_back_what_the_command_printed_and_how_it_ended():
+	"""The exit code was read only to spot a missing shell, then thrown away."""
+	manager = dcb.DockerManager("h_local")
+	manager.client = MagicMock()
+	container = manager.client.containers.get.return_value
+	container.exec_run.return_value = MagicMock(exit_code=3, output=b"")
+	assert manager.execute_command("abc", "web", "exit 3") == ("", 3)
+	container.exec_run.return_value = MagicMock(exit_code=0, output=b"caf\xe9")
+	assert manager.execute_command("abc", "web", "cat f") == ("caf\ufffd", 0)
+
+
+def test_a_scheduled_exec_hands_its_setting_to_the_result():
+	"""The scheduler passes the stored value; the result decides from it."""
+	results = []
+	owner = MagicMock()
+	owner.execute_command = lambda **kw: ("", 0)
+	original = (dcb.manager_for, dcb._send_exec_result)
+	dcb.manager_for = lambda ref: owner
+	dcb._send_exec_result = lambda *a, **kw: results.append(kw.get("only_failures"))
+	try:
+		for mode in (True, dcb.SHOW_OUTPUT_FAILURES, False):
+			dcb.execute_command("h_local:abc12", "db", "check.sh", mode, wait=False)
+		deadline = time.time() + 5
+		while len(results) < 2 and time.time() < deadline:
+			time.sleep(0.01)
+		time.sleep(0.1)
+		assert sorted(results) == [False, True], results
+	finally:
+		dcb.manager_for, dcb._send_exec_result = original
+
+
+def test_what_counts_as_a_prune_that_removed_something():
+	assert dcb._pruned_anything({"NetworksDeleted": ["old_net"]}) is True
+	assert dcb._pruned_anything({"ContainersDeleted": ["abc"], "SpaceReclaimed": 0}) is True
+	assert dcb._pruned_anything({"SpaceReclaimed": 1024}) is True
+	assert dcb._pruned_anything({"ImagesDeleted": None, "SpaceReclaimed": 0}) is False
+	assert dcb._pruned_anything({"VolumesDeleted": [], "SpaceReclaimed": 0}) is False
+	assert dcb._pruned_anything(None) is False
 
 
 def test_only_the_daemons_own_refusal_means_the_shell_is_missing():
@@ -6841,24 +5890,6 @@ def test_a_button_from_another_chat_does_nothing():
 		spec.handler = original
 
 
-def test_the_schedule_lists_name_tasks_by_id_and_escape_them():
-	"""By position, a stale list deleted another task; unescaped, one '<' broke both lists."""
-	tasks = [{"id": 4, "name": "copia <db>"}, {"id": 7, "name": "b"}]
-	assert dcb._validate_schedule_index("i7", tasks) == 1
-	assert dcb._validate_schedule_index("2", tasks) == -1, "un botón de antes no se adivina"
-	assert dcb._validate_schedule_index("i99", tasks) == -1
-	sent, markups = [], []
-	original = (dcb.send_split_message, dcb.schedule_manager.get_all_schedules)
-	dcb.send_split_message = lambda text, reply_markup=None: sent.append(text) or markups.append(reply_markup)
-	dcb.schedule_manager.get_all_schedules = lambda: tasks
-	try:
-		dcb.show_schedule_delete_list(1, 1)
-		assert "copia &lt;db&gt;" in sent[-1], sent[-1]
-		assert "scheduleSelectDelete|i4" in harness.keyboard_callbacks(markups[-1])
-	finally:
-		dcb.send_split_message, dcb.schedule_manager.get_all_schedules = original
-
-
 def test_a_picker_longer_than_a_keyboard_comes_in_pages():
 	"""More than about a hundred buttons and Telegram refused the whole message."""
 	_with_hosts([HOST_FIXTURE[0]], unreachable=())
@@ -6907,16 +5938,200 @@ def test_the_update_check_skips_a_container_gone_since_the_listing():
 		_restore_hosts()
 
 
-def test_an_unreadable_settings_file_switches_no_task_off():
-	"""Every task's host looked gone, and the executor switched them all off."""
-	task = _orphaned_prune_task(host="h_gone", enabled=True)
-	original = store.settings_unreadable
-	store.settings_unreadable = lambda: "Expecting ',' delimiter"
+class _FollowedLogs:
+	"""
+	A /logs followed in milliseconds instead of seconds, with the log, what
+	is sent and every edit in the open.
+	"""
+
+	def __init__(self, every=0.05, lasting=0.4):
+		self.log = {"web": "uno", "db": "uno"}
+		self.edits = []
+		self.sent = []
+		self.editable = True
+		self._timing = (every, lasting)
+
+	def __enter__(self):
+		self._original = (dcb.read_logs, dcb.edit_message_text_sync, dcb.send_message, dcb.save_container_refs,
+							dcb.LOGS_FOLLOW_EVERY, dcb.LOGS_FOLLOW_FOR)
+		dcb.LOGS_FOLLOW_EVERY, dcb.LOGS_FOLLOW_FOR = self._timing
+		dcb.read_logs = lambda ref, name: None if self.log[name] is None else f"<pre>{self.log[name]}</pre>"
+		dcb.save_container_refs = lambda *a, **k: None
+
+		def edit(text, chat_id, message_id, parse_mode="html", reply_markup=None):
+			self.edits.append((chat_id, message_id, text, harness.keyboard_callbacks(reply_markup)))
+			return MagicMock() if self.editable else None
+
+		def send(message=None, reply_markup=None, **kw):
+			sent = MagicMock(message_id=50 + len(self.sent))
+			sent.chat.id = kw.get("chat_id") or 1
+			self.sent.append((message, harness.keyboard_callbacks(reply_markup)))
+			return sent
+
+		dcb.edit_message_text_sync = edit
+		dcb.send_message = send
+		return self
+
+	def __exit__(self, *exc):
+		self.settle()
+		(dcb.read_logs, dcb.edit_message_text_sync, dcb.send_message, dcb.save_container_refs,
+			dcb.LOGS_FOLLOW_EVERY, dcb.LOGS_FOLLOW_FOR) = self._original
+
+	def settle(self, seconds=3):
+		"""Waits until nothing is being followed."""
+		deadline = time.time() + seconds
+		while dcb.log_followers._following and time.time() < deadline:
+			time.sleep(0.01)
+		assert not dcb.log_followers._following, "un seguimiento no ha terminado"
+
+
+def _following(text):
+	return text.endswith(f"<i>{i18n.get_text('logs_following', dcb.LOGS_FOLLOW_EVERY)}</i>")
+
+
+def _resting(text):
+	return i18n.get_text("logs_paused", "").rstrip() in text and not _following(text)
+
+
+def test_logs_are_followed_for_a_while_and_then_rest():
+	"""
+	Like `tail -f`, for half a minute: the message is repainted when the log
+	moves, never when it has not —an edit that changes nothing still counts
+	against Telegram's limits— and then left at rest saying when it was read.
+	"""
+	with _FollowedLogs() as followed:
+		dcb.logs("h_local:abc12", "web")
+		text, buttons = followed.sent[0]
+		assert _following(text) and buttons == ["logsPause|h_local:abc12", "cerrar"], followed.sent
+		time.sleep(0.12)
+		followed.log["web"] = "uno\ndos"
+		followed.settle()
+		texts = [text for _chat, _message, text, _buttons in followed.edits]
+		assert any("dos" in text and _following(text) for text in texts), texts
+		assert len(texts) <= 2, f"edita aunque el log no cambie: {texts}"
+		_chat, _message, last, buttons = followed.edits[-1]
+		assert _resting(last) and "dos" in last, last
+		assert dcb.datetime.now().strftime("%H:%M") in last
+		assert buttons == ["logsFollow|h_local:abc12", "cerrar"], buttons
+
+
+def test_pausing_rests_at_once_and_resuming_follows_again():
+	with _FollowedLogs(lasting=5) as followed:
+		dcb.logs("h_local:abc12", "web")
+		started = time.time()
+		dcb.log_followers.pause("h_local:abc12", "web", 1, 50)
+		followed.settle()
+		assert time.time() - started < 1, "la pausa esperó a que acabara el seguimiento"
+		assert len(followed.edits) == 1 and _resting(followed.edits[0][2]), followed.edits
+
+		dcb.LOGS_FOLLOW_FOR = 0.2
+		dcb.log_followers.follow("h_local:abc12", "web", 1, 50)
+		followed.settle()
+		first, last = followed.edits[1][2], followed.edits[-1][2]
+		assert _following(first) and _resting(last), followed.edits
+
+
+def test_a_closed_log_message_stops_being_followed():
+	"""Closing deletes the message: the next edit fails, and with it the thread."""
+	with _FollowedLogs() as followed:
+		followed.editable = False
+		dcb.logs("h_local:abc12", "web")
+		followed.log["web"] = "dos"
+		followed.settle()
+		assert len(followed.edits) == 1, followed.edits
+
+
+def test_one_log_is_followed_per_chat():
+	"""Two at once in a group would be twenty-four edits a minute, past the twenty it takes."""
+	with _FollowedLogs(lasting=5) as followed:
+		dcb.logs("h_local:abc12", "web")
+		dcb.logs("h_local:def34", "db")
+		time.sleep(0.1)
+		assert [(chat, message) for chat, message, _text, _buttons in followed.edits] == [(1, 50)], followed.edits
+		assert _resting(followed.edits[0][2])
+		assert list(dcb.log_followers._following) == [1] and dcb.log_followers._following[1]["message"] == 51
+		dcb.log_followers.pause("h_local:def34", "db", 1, 51)
+
+
+def test_resuming_twice_follows_once():
+	with _FollowedLogs(lasting=0.3) as followed:
+		dcb.log_followers.follow("h_local:abc12", "web", 1, 50)
+		dcb.log_followers.follow("h_local:abc12", "web", 1, 50)
+		followed.settle()
+		assert _resting(followed.edits[-1][2]), followed.edits
+		assert sum(1 for edit in followed.edits if _resting(edit[2])) == 1, followed.edits
+
+
+def test_a_log_followed_before_a_restart_can_still_be_paused():
+	"""Its thread is gone, but the message still says it is following."""
+	with _FollowedLogs() as followed:
+		dcb.log_followers.pause("h_local:abc12", "web", 1, 77)
+		assert len(followed.edits) == 1 and _resting(followed.edits[0][2]), followed.edits
+
+
+def test_a_log_that_cannot_be_read_any_more_rests_as_last_read():
+	with _FollowedLogs() as followed:
+		dcb.logs("h_local:abc12", "web")
+		followed.log["web"] = None
+		followed.settle()
+		last = followed.edits[-1][2]
+		assert _resting(last) and "uno" in last, last
+
+
+def test_the_log_window_keeps_the_end_from_a_whole_line_and_fits_telegram():
+	"""
+	The window drops the oldest at the top. It was cut by Python characters,
+	mid-line, and a log full of emoji —two of Telegram's each— went past 4096
+	and the message was refused.
+	"""
+	def units(text):
+		return len(text.encode("utf-16-le")) // 2
+
+	lines = "\n".join(f"línea {number}" for number in range(1, 500))
+	tail = formatting.telegram_tail(lines, 100)
+	assert tail.endswith("línea 499") and units(tail) <= 100, tail
+	assert tail.split("\n")[0].startswith("línea ") and tail.split("\n")[0] in lines.split("\n"), tail
+	# Cut right after a newline, the first line is already whole and stays.
+	assert formatting.telegram_tail("aaa\nbbb\nccc", 7) == "bbb\nccc"
+	# A single line longer than the window is all there is: its end, rather than nothing.
+	assert formatting.telegram_tail("x" * 50, 10) == "x" * 10
+	assert formatting.telegram_tail("corto", 100) == "corto"
+
+	emoji = "\n".join("🚀🔥🎉 ok" for _ in range(2000))
+	assert units(formatting.telegram_tail(emoji, 3500)) <= 3500
+
+	manager = dcb.DockerManager("h_local")
+	container = MagicMock()
+	container.logs.return_value = emoji.encode()
+	manager.client = MagicMock()
+	manager.client.containers.get.return_value = container
+	body = manager.show_logs("abc12", "web")
+	shown = html.unescape(re.sub(r"<[^>]+>", "", dcb.logs_message(body, True, dcb.datetime.now())))
+	assert units(shown) < 4096, units(shown)
+
+
+def test_exec_output_fits_telegram_and_the_rest_goes_as_a_file():
+	"""Cut at 3500 of Python's characters, a command printing emoji went past 4096 and nothing arrived."""
+	def units(text):
+		return len(text.encode("utf-16-le")) // 2
+
+	assert formatting.telegram_head("🚀" * 10, 7) == "🚀" * 3
+	assert formatting.telegram_head("corto", 100) == "corto"
+	sent, documents = [], []
+	original = (dcb.send_message, dcb.send_document)
+	dcb.send_message = lambda **kw: sent.append(kw.get("message", "")) or MagicMock()
+	dcb.send_document = lambda **kw: documents.append(kw) or MagicMock()
 	try:
-		assert dcb.schedule_host_missing(task) is False
+		output = "\n".join("🚀🔥🎉 ok" for _ in range(1000))
+		dcb._send_exec_result("h_local:abc12", "web", "🎉" * 400, (output, 2))
+		shown = html.unescape(re.sub(r"<[^>]+>", "", sent[-1]))
+		assert units(shown) < 4096, units(shown)
+		assert len(documents) == 1, "lo que no cabe va en un fichero"
+		sent.clear(), documents.clear()
+		dcb._send_exec_result("h_local:abc12", "web", "echo hola", ("🚀 hola", 0))
+		assert "🚀 hola" in sent[-1] and documents == []
 	finally:
-		store.settings_unreadable = original
-	assert dcb.schedule_host_missing(task) is True
+		dcb.send_message, dcb.send_document = original
 
 
 def test_logs_are_read_from_the_end_and_in_any_encoding():
@@ -7000,23 +6215,6 @@ def test_a_scheduled_mute_never_shortens_a_longer_one():
 	finally:
 		dcb.unmute()
 		dcb.send_message = original
-
-
-def test_the_spring_clock_change_does_not_skip_the_tasks_of_the_lost_hour():
-	"""From 01:59 to 03:00 in one real minute, taken for an hour the bot was off."""
-	import datetime as dt
-	monitor = dcb.DockerScheduleMonitor.__new__(dcb.DockerScheduleMonitor)
-	# The wall clock jumps an hour in a minute of real time, which is what
-	# timestamp() measures: faked here so the test does not depend on the
-	# time zone of the machine running it.
-	class Clock(dt.datetime):
-		def timestamp(self):
-			return 60.0 if (self.hour, self.minute) == (3, 0) else 0.0
-	monitor._last_minute = Clock(2026, 1, 10, 1, 59)
-	assert len(monitor._minutes_due(Clock(2026, 1, 10, 3, 0))) == 61
-	monitor._last_minute = dt.datetime(2026, 1, 10, 1, 59)
-	assert monitor._minutes_due(dt.datetime(2026, 1, 10, 3, 0)) == [dt.datetime(2026, 1, 10, 3, 0)], \
-		"una hora de verdad sigue siendo un hueco que no se repite"
 
 
 def test_the_platform_manifest_decides_an_update_on_containerd():
@@ -8176,13 +7374,14 @@ def test_a_repainted_info_says_the_versions_and_last_check_there_are_now():
 		_restore_hosts()
 
 
-def _press_with_the_name_not_cached(data, owner_for, named=None, message_id=9876, alerts=None, manager=None):
+def _press_with_the_name_not_cached(data, owner_for, named=None, message_id=9876, alerts=None, manager=None,
+									drawn_at=None):
 	"""
 	Presses `data` through the dispatcher on a message with no names saved,
 	`owner_for(ref)` standing in for manager_for and `named` for what the
 	host finds by name (or `manager` for the whole host). Returns what was
 	sent, what was deleted and which queries were answered; the alerts go
-	to `alerts`.
+	to `alerts`. The message was sent at `drawn_at`, by default just now.
 	"""
 	admin = int(str(dcb.TELEGRAM_ADMIN).split(",")[0])
 	sent, deleted, answers = [], [], []
@@ -8204,6 +7403,7 @@ def _press_with_the_name_not_cached(data, owner_for, named=None, message_id=9876
 	press = MagicMock()
 	press.data, press.id = data, "q1"
 	press.message.id, press.message.chat.id, press.message.chat.type = message_id, admin, "private"
+	press.message.date, press.message.edit_date = drawn_at or int(time.time()), None
 	press.from_user.id, press.from_user.username = admin, "test"
 	try:
 		dcb.button_controller(press)
@@ -8336,12 +7536,44 @@ def test_a_gone_container_is_not_found_again_by_its_id_prefix():
 		before = dcb.manager_for
 		dcb.manager_for = _owner_whose_lookup(ambiguous)
 		try:
-			assert dcb.name_by_reference(ref) == (None, None)
+			assert dcb.name_by_reference(ref, int(time.time())) == (None, None)
 		finally:
 			dcb.manager_for = before
 	finally:
 		dcb.logs = original
 		dcb.clear_update_data(admin, 9879)
+
+
+def test_a_button_with_no_name_does_not_act_on_a_container_created_after_it():
+	"""
+	A confirmation keeps no names: its button says the host and five
+	characters of the ID, and nothing else. With the container it meant
+	recreated since, another whose ID starts the same was what the prefix
+	found, and the delete landed on it. One created after the message cannot
+	be the button's, so the button's is gone; one already there when it was
+	sent still answers.
+	"""
+	from datetime import datetime, timezone
+	local = dcb.host_registry.local_host_id()
+	ref = dcb.make_ref(local, "ff2e3")
+	sent_at = int(time.time()) - 3600
+	for name, created, acts in (("c1015", sent_at + 60, False), ("plex", sent_at - 60, True)):
+		stamp = datetime.fromtimestamp(created, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.123456789Z")
+		found = types.SimpleNamespace(id="ff2e3" + "1" * 59, name=name, attrs={"Created": stamp})
+		removed = []
+
+		def owner_for(r):
+			return types.SimpleNamespace(
+				client=types.SimpleNamespace(containers=types.SimpleNamespace(get=lambda cid: found)),
+				delete=lambda container_id, container_name: removed.append(container_name) or "")
+		sent, deleted, answers = _press_with_the_name_not_cached(
+			f"delete|{ref}", owner_for, named=found, drawn_at=sent_at)
+		if acts:
+			assert removed == ["plex"], (name, removed, sent)
+		else:
+			assert removed == [] and "c1015" not in "".join(sent), (removed, sent)
+			assert sent and "ff2e3" in sent[-1], sent
+		assert answers == ["q1"], (name, answers)
 
 
 def test_a_known_name_on_a_host_that_does_not_answer_is_answered_once():
@@ -8367,3 +7599,53 @@ def test_a_known_name_on_a_host_that_does_not_answer_is_answered_once():
 			assert answers == ["q1"], (data, answers)
 	finally:
 		dcb.clear_update_data(admin, 9880)
+
+
+def test_unraid_is_told_about_an_update_once_it_went_through():
+	"""
+	Only a container that was actually updated, and the bot itself when it
+	comes back from updating: it goes down before it could say so.
+	"""
+	told = []
+
+	class Owner:
+		host_id = "h_local"
+
+		def __init__(self, works):
+			self.works = works
+			# Outside any Compose project, so there are no dependents to restart.
+			self.client = MagicMock()
+			self.client.containers.get.return_value.labels = {}
+
+		def update(self, **kw):
+			return i18n.get_text("updated_container" if self.works else "error_updating_container", "nginx")
+
+	original = dcb.manager, dcb.tell_unraid_updated
+	dcb.tell_unraid_updated = lambda owner, container: told.append((owner.host_id, container))
+	try:
+		ref = dcb.make_ref("h_local", "abcde")
+		dcb.manager = lambda host_id=None: Owner(True)
+		dcb.perform_container_update(ref, "nginx", send_fn=lambda msg: None)
+		assert len(told) == 1, told
+		told.clear()
+		dcb.manager = lambda host_id=None: Owner(False)
+		dcb.perform_container_update(ref, "nginx", send_fn=lambda msg: None)
+		assert told == [], told
+	finally:
+		dcb.manager, dcb.tell_unraid_updated = original
+
+	local = MagicMock()
+	local.host_id = "h_local"
+	stubs = {"get_container_id_by_name": lambda name: "f" * 64, "local_manager": lambda: local,
+			 "own_container_name": lambda: "docker-controller-bot", "stop_container": lambda container: None,
+			 "send_message": lambda **kw: None, "tell_unraid_updated": lambda owner, container: told.append((owner, container))}
+	saved = {name: getattr(dcb, name) for name in stubs}
+	for name, stub in stubs.items():
+		setattr(dcb, name, stub)
+	try:
+		dcb.delete_updater()
+		assert told == [(local, local.client.containers.get.return_value)], told
+		assert local.client.containers.get.call_args.args == ("docker-controller-bot",)
+	finally:
+		for name, value in saved.items():
+			setattr(dcb, name, value)

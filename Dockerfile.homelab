@@ -37,8 +37,7 @@ RUN mkdir -p /etc/ssh/ssh_config.d && \
     printf 'Host *\n    BatchMode yes\n    ConnectTimeout 10\n    ServerAliveInterval 10\n    ServerAliveCountMax 3\n' \
         > /etc/ssh/ssh_config.d/docker-controller-bot.conf
 
-COPY *.py /app/
-COPY locale /app/locale
+COPY src/ /app/
 COPY homelab /app/homelab
 
 # The worker heartbeat goes stale when the bot stops processing commands.

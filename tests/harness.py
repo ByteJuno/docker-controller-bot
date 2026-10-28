@@ -18,6 +18,8 @@ from unittest.mock import MagicMock
 warnings.filterwarnings("ignore")
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# The bot's code, which runs from here: in the image it is all of /app.
+SRC = os.path.join(REPO, "src")
 DATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 
 # Variables the bot refuses to start without. The values only have to be
@@ -63,8 +65,8 @@ def temp_storage(env=None, legacy=False, seed_files=None):
 	can be exercised. `seed_files` writes files into it first, which is how a
 	pre-existing 4.x install is simulated.
 	"""
-	if REPO not in sys.path:
-		sys.path.insert(0, REPO)
+	if SRC not in sys.path:
+		sys.path.insert(0, SRC)
 	import store
 
 	root = tempfile.mkdtemp()
@@ -94,7 +96,7 @@ def temp_storage(env=None, legacy=False, seed_files=None):
 
 # Modules that register commands or inline-button callbacks by being imported.
 # The entry point imports them in this order for the same reason.
-REGISTRARS = ("commands", "callbacks")
+REGISTRARS = ("commands", "callbacks", "schedules")
 
 
 _loaded = None
@@ -133,14 +135,20 @@ def load_bot(env=None, real_docker=False):
 	host_registry.reset()
 
 	core = _import("core")
+	# No /logs is followed unless a test asks: its thread repaints the message
+	# for half a minute, well past the test that sent it.
+	core.LOGS_FOLLOW_FOR = 0
 	for name in REGISTRARS:
-		_import(name)
+		# Once each, like the entry point: commands imports schedules itself,
+		# and running a registrar twice registers its callbacks twice.
+		if name not in sys.modules or sys.modules[name].__dict__.get("core") is not core:
+			_import(name)
 	_loaded = (core, store, root)
 	return _loaded
 
 
 def _import(name):
-	spec = importlib.util.spec_from_file_location(name, os.path.join(REPO, f"{name}.py"))
+	spec = importlib.util.spec_from_file_location(name, os.path.join(SRC, f"{name}.py"))
 	module = importlib.util.module_from_spec(spec)
 	sys.modules[name] = module
 	spec.loader.exec_module(module)

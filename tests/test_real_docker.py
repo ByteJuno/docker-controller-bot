@@ -38,8 +38,8 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import harness
 
-if harness.REPO not in sys.path:
-	sys.path.insert(0, harness.REPO)
+if harness.SRC not in sys.path:
+	sys.path.insert(0, harness.SRC)
 
 import docker
 import docker.errors
@@ -1389,7 +1389,9 @@ def test_the_event_monitor_says_why_a_container_stopped_and_when_it_is_unhealthy
 			return client.containers.run(BASE, command, name=PREFIX + name, detach=True, labels=LABEL, **kwargs)
 		go("finishes", ["sh", "-c", "sleep 1; exit 0"])
 		go("fails", ["sh", "-c", "echo 'ERROR: <sin base de datos>' >&2; sleep 1; exit 3"])
-		go("oom", ["sh", "-c", "sleep 1; tail /dev/zero"], mem_limit="8m", memswap_limit="8m")
+		# 8m was too little for runc itself on a loaded machine, and the
+		# container never started.
+		go("oom", ["sh", "-c", "sleep 1; tail /dev/zero"], mem_limit="32m", memswap_limit="32m")
 		stopped = go("stopped", ["sleep", "300"])
 		sick = go("sick", ["sh", "-c", "touch /ok; sleep 300"],
 					healthcheck={"test": ["CMD", "test", "-f", "/ok"], "interval": 1_000_000_000, "retries": 2})
@@ -1409,7 +1411,15 @@ def test_the_event_monitor_says_why_a_container_stopped_and_when_it_is_unhealthy
 		assert (core.get_text("container_finished", name("finishes")), None) in said["finishes"], said
 		failed = [m for m in said["fails"] if m[0] == core.get_text("container_failed", name("fails"), "3")]
 		assert failed and "ERROR: &lt;sin base de datos&gt;" in failed[0][1], said["fails"]
-		assert (core.get_text("container_oom", name("oom")), None) in said["oom"], said["oom"]
+		# On a loaded machine Docker can lose the "oom" altogether, and then
+		# it does not know either: State.OOMKilled comes from that event.
+		if client.api.inspect_container(name("oom"))["State"]["OOMKilled"]:
+			assert (core.get_text("container_oom", name("oom")), None) in said["oom"], said["oom"]
+		else:
+			# Its start is announced too: what is checked is how it ended.
+			killed = core.get_text("container_failed", name("oom"), "137 (SIGKILL)")
+			started = core.get_text("started_container", name("oom"))
+			assert [m for m, _ in said["oom"] if m != started] == [killed], said["oom"]
 		assert (core.get_text("stopped_container", name("stopped")), None) in said["stopped"], said["stopped"]
 		health = [m for m, _ in said["sick"] if "sick" in m and "🟢" not in m]
 		assert health == [core.get_text("container_unhealthy", name("sick")),
@@ -1541,6 +1551,61 @@ def test_one_pass_updates_what_is_set_to_on_its_own_in_one_batch():
 	finally:
 		core.DockerManager.list_containers = original
 		core.store.forget_host_containers(local)
+		cleanup()
+
+
+def test_unraid_is_told_through_a_helper_that_never_starts():
+	"""
+	What unraid.py writes, written by Docker itself: a helper created and never
+	started, the files read and written through the API `docker cp` uses.
+	Unraid's directories are temporary ones here, and the host is taken for
+	Unraid; the rest is as on a real one, image VOLUME included.
+	"""
+	import json
+	import shutil
+
+	import unraid
+
+	_setup()
+	status_dir, info_dir = tempfile.mkdtemp(), tempfile.mkdtemp()
+	saved = unraid.STATUS_DIR, unraid.INFO_DIR, unraid.is_unraid
+	try:
+		publish("1", "VOLUME /db")
+		container = run("unraid", labels={unraid.MANAGED_LABEL: unraid.MANAGED_BY_UNRAID})
+		key = f"{IMAGE}:latest"
+		old = "sha256:" + "0" * 64
+		other = {"local": old, "remote": old, "status": "true"}
+		with open(os.path.join(status_dir, unraid.STATUS_FILE), "w") as f:
+			json.dump({key: {"local": old, "remote": "sha256:" + "1" * 64, "status": "false"},
+						"lscr.io/linuxserver/plex:latest": other}, f, indent=4)
+		with open(os.path.join(info_dir, unraid.INFO_FILE), "w") as f:
+			json.dump({container.name: {"updated": "false"}, "plex": {"updated": "true"}}, f, indent=4)
+		volumes_before = {v.name for v in client.volumes.list()}
+
+		unraid.STATUS_DIR, unraid.INFO_DIR = status_dir, info_dir
+		unraid.is_unraid = lambda client: True
+		logged = []
+		unraid.sync_after_update(client, "h_local", fetch("unraid"), logged.append)
+
+		digest = unraid.pulled_digest(client.images.get(container.image.id).attrs["RepoDigests"], key)
+		assert digest, logged
+		with open(os.path.join(status_dir, unraid.STATUS_FILE)) as f:
+			status = json.load(f)
+		assert status[key] == {"local": digest, "remote": digest, "status": "true"}, (status, logged)
+		assert status["lscr.io/linuxserver/plex:latest"] == other
+		with open(os.path.join(info_dir, unraid.INFO_FILE)) as f:
+			assert json.load(f) == {"plex": {"updated": "true"}}, logged
+		assert not [c.name for c in client.containers.list(all=True) if c.name.startswith(unraid.HELPER_PREFIX)]
+		# The image's VOLUME got a tmpfs, not an anonymous volume left behind.
+		assert {v.name for v in client.volumes.list()} == volumes_before
+		events = client.events(since=int(time.time()) - 60, until=int(time.time()) + 1, decode=True,
+								filters={"type": "container", "label": f"{unraid.HELPER_LABEL}={unraid.HELPER_KIND}"})
+		actions = {event.get("Action") for event in events}
+		assert "create" in actions and "destroy" in actions and "start" not in actions, actions
+	finally:
+		unraid.STATUS_DIR, unraid.INFO_DIR, unraid.is_unraid = saved
+		shutil.rmtree(status_dir, ignore_errors=True)
+		shutil.rmtree(info_dir, ignore_errors=True)
 		cleanup()
 
 

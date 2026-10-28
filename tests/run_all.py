@@ -17,11 +17,11 @@ import sys
 import traceback
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-REPO = os.path.dirname(HERE)
+SRC = os.path.join(os.path.dirname(HERE), "src")
 
 # test_store and test_migration expect a clean import; test_bot loads the bot
 # module, which is global state, so it goes last.
-MODULES = ("test_lint", "test_store", "test_migration", "test_support", "test_identity", "test_hosts", "test_update", "test_bot", "test_monitors", "test_listing")
+MODULES = ("test_lint", "test_store", "test_migration", "test_support", "test_identity", "test_hosts", "test_update", "test_unraid", "test_bot", "test_schedules", "test_monitors", "test_listing")
 
 # Against the real daemon, so not by default: they need Docker running, create
 # and update containers, and take minutes. `--docker` runs these and nothing
@@ -39,7 +39,7 @@ def load(name):
 
 
 def run(selector=None, modules=MODULES):
-	sys.path.insert(0, REPO)
+	sys.path.insert(0, SRC)
 	sys.path.insert(0, HERE)
 	# The tests chdir into temporary directories; come back afterwards.
 	original_cwd = os.getcwd()

@@ -40,7 +40,7 @@ def test_dockerfile_uses_the_same_healthcheck():
 	text = (REPO / "Dockerfile.homelab").read_text()
 	assert 'CMD ["python3", "homelab/healthcheck.py"]' in text
 	assert 'sys.exit(0)' not in text
-	assert 'HEARTBEAT_PATH = "/tmp/dcb-heartbeat"' in (REPO / "core.py").read_text()
+	assert 'HEARTBEAT_PATH = "/tmp/dcb-heartbeat"' in (REPO / "src" / "core.py").read_text()
 
 
 def image_smoke(image):
