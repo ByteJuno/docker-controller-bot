@@ -38,7 +38,13 @@ RUN mkdir -p /etc/ssh/ssh_config.d && \
         > /etc/ssh/ssh_config.d/docker-controller-bot.conf
 
 COPY src/ /app/
+RUN chmod +x /app/dcb_mute.py && \
+    ln -s /app/dcb_mute.py /usr/local/bin/dcb-mute
 COPY homelab /app/homelab
+
+# Exercise the installed command through PATH in the real image filesystem.
+# No arguments must report usage without writing config or needing a running bot.
+RUN python3 -c 'import subprocess; result = subprocess.run(["dcb-mute"], capture_output=True, text=True, timeout=30); assert result.returncode == 2, result; assert result.stderr.startswith("usage: dcb-mute <minutes>"), result'
 
 # The worker heartbeat goes stale when the bot stops processing commands.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
