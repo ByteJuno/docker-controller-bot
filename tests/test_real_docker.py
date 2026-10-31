@@ -1663,7 +1663,12 @@ def test_the_monitor_hears_through_its_filter_what_it_reads():
 
 	actions = {action.split(":")[0] for action in received}
 	assert actions <= set(core.MONITORED_EVENTS), actions
-	assert {"create", "start", "kill", "die", "oom", "health_status"} <= actions, actions
+	# Docker can lose the "oom" event altogether on a loaded runner (see the
+	# OOM tests above), and the 8 MiB container then only shows up as kill/die.
+	# What this test owns is the filter: "oom" must be one of the events the
+	# monitor asks Docker for, and anything it does receive must pass it.
+	assert "oom" in core.MONITORED_EVENTS, core.MONITORED_EVENTS
+	assert {"create", "start", "kill", "die", "health_status"} <= actions, actions
 	assert not [a for a in received if a.startswith("exec_")], received
 	assert core.get_text("started_container", plain.name) in announced, announced
 	assert core.get_text("stopped_container", plain.name) in announced, announced
