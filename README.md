@@ -111,7 +111,8 @@ volumes:
 - 🧩 **Compose:** detecta tus proyectos y los agrupa (proyecto → contenedores).
 - 📊 **Diagnóstico:** logs en el chat o como fichero, `exec` dentro del contenedor, puertos e info detallada.
 - 🔄 **Actualizaciones:** te avisa si hay imagen nueva, actualiza uno o todos, cambia de tag (rollback) y deja que elijas, contenedor a contenedor, cuáles se actualizan solos y cuáles no se comprueban.
-- ⏰ **Automatización:** tareas programadas con cron + silencio temporal con `/mute` + limpieza con `/prune`.
+- 🔔 **Avisos:** te dice cuándo un contenedor arranca, se para, se cae, se queda sin memoria o falla su healthcheck, y tú eliges de qué te avisa cada uno: todo, solo problemas o nada.
+- ⏰ **Automatización:** tareas programadas con cron + silencio temporal con `/mute` o desde un script con `dcb-mute` + limpieza con `/prune`.
 - 🖥️ **Multi-host y ajustes:** varios servidores desde un solo bot y todo configurable con `/settings`, sin reiniciar.
 
 <details>
@@ -124,6 +125,7 @@ volumes:
 - ✅ Obtener los logs tanto de manera directa como a través de fichero
 - ✅ Extraer el docker-compose de tus contenedores
 - ✅ Notificaciones cuando un contenedor se cae o se inicia
+- ✅ Avisos por contenedor: todos, solo problemas o ninguno, desde `/info`, `/settings` o la label `DCB-Notifications`
 - ✅ Notificaciones cuando un contenedor tiene una actualización pendiente
 - ✅ Actualizaciones de los contenedores
 - ✅ Cambiar el tag (rollback o actualización)
@@ -136,7 +138,7 @@ volumes:
 - ✅ Se identifica a sí mismo sin ayuda: no hay que decirle cómo se llama su contenedor para que sepa no pararse ni eliminarse
 - ✅ Ajustes editables desde el propio bot con `/settings`, sin tocar el docker-compose ni reiniciar
 - ✅ Menú principal por botones en `/start`, agrupado en categorías; los comandos escritos siguen funcionando igual
-- ✅ Silencia las notificaciones de forma temporal
+- ✅ Silencia las notificaciones de forma temporal, también desde un script con `dcb-mute`
 - ✅ Imagen multiarquitectura (amd64, arm64, armv7…) compatible con Raspberry Pi, NAS y servidores estándar
 - ✅ Soporte de idiomas (Spanish, English, Dutch, German, Russian, Galician, Italian, Catalan)
 
@@ -186,6 +188,24 @@ Desde `/schedule` puedes crear tareas que se ejecuten en cron.
 - Acepta expresiones cron estándar (`0 */4 * * *`) y atajos: `@yearly`, `@monthly`, `@weekly`, `@daily`, `@hourly` y `@reboot`.
 - Si tienes varios hosts, el bot te pregunta en cuál se ejecuta la tarea, y el host aparece en el resumen y en el listado. `mute` es la excepción: silencia las notificaciones del propio bot, así que no pertenece a ninguna máquina.
 - Las programaciones se persisten en `/app/config` (recuerda mapear ese volumen).
+
+</details>
+
+<details>
+<summary>🔕 Silenciar el bot desde un script</summary>
+
+Un script puede silenciar el bot sin pasar por Telegram, por ejemplo mientras para contenedores para hacer una copia de seguridad:
+
+```sh
+docker exec docker-controller-bot dcb-mute 60   # silencia 60 minutos
+docker exec docker-controller-bot dcb-mute 0    # quita el silencio
+```
+
+- Espera a que el bot lo aplique, un par de segundos, y sale con un código distinto de 0 si no lo ha hecho.
+- Manda el último cambio, venga del script o de `/mute`, sea más largo o más corto.
+- Tiene el mismo límite que `/mute`.
+- Si lo que quieres es que no avisen los contenedores que para tu copia de seguridad, sin callar todo lo demás, ponles «⚠️ Solo problemas»: ver *«De qué avisa cada contenedor»*.
+- Como en la 4.x, también vale escribir a mano en `.muted_until`, dentro del volumen de datos (`/app/config`, o `/app/schedule` si tu instalación aún usa el de la 4.x), el segundo epoch en que termina el silencio, o `0` para quitarlo: `sh -c 'echo $(( $(date +%s) + 3600 )) > /app/config/.muted_until'`. El bot lo aplica redondeado al minuto hacia arriba y lo borra, también si lo encuentra al arrancar.
 
 </details>
 
@@ -476,6 +496,20 @@ También sirven las labels de siempre, `DCB-Auto-Update` y `DCB-Ignore-Check-Upd
 
 </details>
 
+<details>
+<summary>🔔 De qué avisa cada contenedor</summary>
+
+Por defecto el bot avisa de todo lo que le pasa a un contenedor: cuando arranca, cuando se para, cuando falla. Para cada uno puedes elegir menos:
+
+- **⚠️ Solo problemas:** calla los arranques, las paradas que se piden (un `docker stop`, el bot, una tarea, un script de copia de seguridad) y los procesos que terminan bien, y sigue avisando de lo que falla: una caída con código distinto de 0, la falta de memoria, un healthcheck que falla y cuando vuelve a ir, y los bucles de reinicio.
+- **🔕 Ninguno:** no avisa de nada de ese contenedor.
+
+Se elige en el `/info` de un contenedor, con el botón **🤖 - Avisos**, o para muchos a la vez en `/settings` → **🔔 Avisos por contenedor**. Se guarda igual que lo de las actualizaciones, y también se puede poner en el compose con la label `DCB-Notifications=problems` o `DCB-Notifications=none`, que manda sobre lo elegido en el bot.
+
+Lo que pidas tú desde el bot (arrancar, parar, reiniciar) te lo confirma igualmente. Y no gasta nada: el bot lo decide con la label que ya viene en cada evento de Docker y con los ajustes que tiene en memoria, sin preguntar nada más a Docker.
+
+</details>
+
 ## 📊 Estadísticas anónimas
 
 Desde la 5.0.0 el bot envía una vez al día unas cifras anónimas para saber cuánta gente lo usa, en cuántos hosts y qué funciones se usan más. Así sé dónde poner el esfuerzo. Las estadísticas son públicas: [stats.dgongut.com/docker-controller-bot](https://stats.dgongut.com/docker-controller-bot).
@@ -537,11 +571,12 @@ Tampoco se envía nada si la configuración no está en un volumen, porque sin �
 <details>
 <summary>🛠️ He visto que se pueden añadir labels para controlar ciertas cosas de los contenedores, ¿cómo lo hago?</summary>
 
-Efectivamente, hay dos etiquetas (*labels*) que puedes añadir a los contenedores para controlarlos:  
+Efectivamente, hay tres etiquetas (*labels*) que puedes añadir a los contenedores para controlarlos:  
 - `DCB-Ignore-Check-Updates`  
-- `DCB-Auto-Update`
+- `DCB-Auto-Update`  
+- `DCB-Notifications=problems` o `DCB-Notifications=none`, para que solo avise de problemas o de nada
 
-Lo mismo se puede elegir desde el propio bot, sin tocar el compose: en el `/info` de cada contenedor o en `/settings` → Actualizaciones → 📦 Por contenedor. Si un contenedor lleva la label, manda la label.
+Lo mismo se puede elegir desde el propio bot, sin tocar el compose: en el `/info` de cada contenedor, en `/settings` → Actualizaciones → 📦 Por contenedor y en `/settings` → 🔔 Avisos por contenedor. Si un contenedor lleva la label, manda la label.
 
 Para añadirlas a un contenedor, basta con editar el archivo `docker-compose.yml` y agregarlas bajo la clave `labels`.  
 A continuación se muestra un ejemplo con **Home Assistant**:
@@ -561,6 +596,7 @@ services:
       - /volume2/temp/ha:/tmp
     labels:
       - "DCB-Auto-Update"
+      - "DCB-Notifications=problems" # solo avisa si falla, no de cada arranque o parada
     restart: unless-stopped
 ```
 </details>
@@ -743,7 +779,8 @@ docker-controller-bot/
     ├── dev
     │   ├── Dockerfile_local
     │   ├── Dockerfile_debug
-    │   └── docker-compose.debug.yaml
+    │   ├── docker-compose.debug.yaml
+    │   └── bench_events.py            # lo que cuesta el monitor de eventos, contra un Docker real
     ├── src
     │   ├── docker-controller-bot.py   # punto de entrada: importa y arranca
     │   ├── core.py                    # el núcleo: DockerManager, monitores, teclados, UI
@@ -757,6 +794,7 @@ docker-controller-bot/
     │   ├── i18n.py                    # carga de idiomas y `get_text`
     │   ├── own_container.py           # se identifica a sí mismo sin que se lo digan
     │   ├── unraid.py                  # avisa a Unraid de lo que actualiza el bot
+    │   ├── dcb_mute.py                # `dcb-mute`: silenciar desde un script
     │   ├── docker_update.py
     │   ├── docker_compose_manager.py
     │   ├── compose_generator.py
