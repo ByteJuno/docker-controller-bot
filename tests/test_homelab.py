@@ -340,6 +340,10 @@ def test_a_damaged_policy_only_checks_and_still_scans():
             explicit = container("ghost-db", "mysql:8.4.10", {du.AUTO_LABEL: "true"})
             assert du.auto_reason(explicit, settings) == "策略文件异常，仅检查"
             assert du.exclusion(plain) is None
+        (tmp / du.POLICY_FILE).write_bytes(b"\xff\xfe\x00")
+        settings = du.policy()
+        assert settings["default"] == "announce", settings
+        assert "UTF-8" in settings["problem"], settings
     finally:
         du.ROOT = old_root
         if old_env is None:

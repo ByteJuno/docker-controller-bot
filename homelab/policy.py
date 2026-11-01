@@ -98,6 +98,8 @@ def read_raw():
         if os.path.lexists(target):
             return None, "策略文件是失效的符号链接"
         return None, None
+    except UnicodeDecodeError:
+        return None, "策略文件不是有效 UTF-8 文本"
     except OSError as ex:
         return None, f"策略文件无法读取（{type(ex).__name__}）"
     try:
