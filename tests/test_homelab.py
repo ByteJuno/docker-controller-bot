@@ -203,6 +203,86 @@ def test_cleanup_covers_updates_marked_failed_by_a_lost_notice():
 	assert result["eligible"] == 2
 
 
+
+def container(name, image, labels=None, status="running", host_config=None):
+	"""A container as the Docker API returns it, with only the fields the plugin reads."""
+	return {"Id": "c" * 64, "Name": "/" + name, "Image": "sha256:" + "a" * 64,
+			"Config": {"Image": image, "Labels": labels or {}},
+			"State": {"Status": status}, "HostConfig": host_config or {}}
+
+
+def test_containers_update_on_their_own_by_default():
+	# 2026-11-01: the daily check updates without asking unless something excludes it.
+	from homelab import docker_updates as du
+	settings = du.policy()
+	assert du.exclusion(container("rsshub", "diygod/rsshub:latest")) is None
+	assert du.auto_reason(container("rsshub", "diygod/rsshub:latest"), settings) is None
+	# A container added tomorrow is covered without touching its compose.
+	assert du.auto_reason(container("brand-new", "ghcr.io/x/y:latest"), settings) is None
+
+
+def test_the_auto_label_still_wins_both_ways():
+	from homelab import docker_updates as du
+	settings = du.policy()
+	# Bare label, as the upstream README writes it, is still an opt-in.
+	assert du.auto_reason(container("rsshub", "diygod/rsshub:latest", {du.AUTO_LABEL: ""}), settings) is None
+	reason = du.auto_reason(container("rsshub", "diygod/rsshub:latest", {du.AUTO_LABEL: "false"}), settings)
+	assert reason == "标签 DCB-Auto-Update=false", reason
+	# An explicit yes overrides the database rule.
+	assert du.auto_reason(container("ghost-db", "mysql:8.4.10", {du.AUTO_LABEL: "true"}), settings) is None
+	# false only stops the automatic part: the container is still checked and announced.
+	assert du.exclusion(container("rsshub", "diygod/rsshub:latest", {du.AUTO_LABEL: "false"})) is None
+
+
+def test_databases_are_not_updated_on_their_own():
+	from homelab import docker_updates as du
+	settings = du.policy()
+	for name, image in (("n8n-postgres", "postgres:17-alpine"), ("ghost-db", "mysql:8.4.10"),
+						("paperless-redis", "redis:8"), ("some-new-db", "mariadb:11")):
+		assert du.auto_reason(container(name, image), settings) == "数据库不自动跨大版本", name
+	# They keep being checked: the candidate is announced with its usual button.
+	assert du.exclusion(container("ghost-db", "mysql:8.4.10")) is None
+	assert du.exclusion(container("paperless-redis", "redis:8")) is None
+	# n8n-postgres stays out of the check altogether, as before.
+	assert du.exclusion(container("n8n-postgres", "postgres:17-alpine")) is not None
+
+
+def test_watchtower_keeps_daidai_panel():
+	from homelab import docker_updates as du
+	settings = du.policy()
+	assert du.auto_reason(container("daidai-panel", "linzixuanzz/daidai-panel:latest"), settings) == "由 Watchtower 负责"
+	assert du.exclusion(container("daidai-panel", "linzixuanzz/daidai-panel:latest")) is None
+
+
+def test_the_ignore_label_is_respected():
+	# The upstream label had no effect on this plugin before; it does now.
+	from homelab import docker_updates as du
+	assert du.exclusion(container("x", "nginx:alpine", {du.IGNORE_LABEL: ""})) == "标签 DCB-Ignore-Check-Updates"
+	assert du.exclusion(container("x", "nginx:alpine", {du.IGNORE_LABEL: "false"})) is None
+
+
+def test_the_policy_file_can_turn_the_default_off():
+	from homelab import docker_updates as du
+	path = homelab_paths.data_file(du.POLICY_FILE)
+	plain = container("rsshub", "diygod/rsshub:latest")
+	try:
+		path.write_text(json.dumps({"default": "announce", "database_names": ["custom-db"],
+									"watchtower_managed": ["other-panel"]}))
+		settings = du.policy()
+		assert settings["default"] == "announce"
+		assert du.auto_reason(plain, settings) == "策略设为只通知"
+		# Lists add to the built-in ones; they never remove a protection.
+		assert "custom-db" in settings["database_names"] and "ghost-db" in settings["database_names"]
+		assert "other-panel" in settings["watchtower_managed"] and "daidai-panel" in settings["watchtower_managed"]
+		# With the default back on, the added name is what keeps that one container out.
+		settings["default"] = "auto"
+		assert du.auto_reason(container("other-panel", "x/y:latest"), settings) == "由 Watchtower 负责"
+	finally:
+		path.unlink()
+	# Without the file the code default is back: automatic again.
+	assert du.auto_reason(plain, du.policy()) is None
+
+
 if __name__ == "__main__":
 	failed = 0
 	for name, fn in sorted(globals().items()):

@@ -6,7 +6,7 @@
 | :--- | :--- |
 | `homelab/main.py` | 镜像入口：把上游的 `docker-controller-bot.py` 当模块加载（命令和回调就注册好了），再装插件、启动 |
 | `homelab/plugins.py` | 把插件装到上游的 bot 上，并挪到上游兜底处理函数的前面；命令菜单里加 `/status` |
-| `homelab/docker_updates.py` | 经 Portainer 查新、按钮确认后更新容器，保留回退容器 2 天，清理构建缓存（每天 03:30 由外部触发 `--scan`） |
+| `homelab/docker_updates.py` | 经 Portainer 查新、默认自动更新（opt-out），保留回退容器 2 天，清理构建缓存（每天 03:30 由外部触发 `--scan`） |
 | `homelab/n8n_status.py` | `/status`：转发给 n8n 的主机状态报告 |
 | `homelab/self_update.py` | 机器人自己的更新（见下） |
 | `homelab/paths.py` | 插件文件放在 bot 的数据卷里（5.x 是 `/app/config`） |
@@ -14,6 +14,34 @@
 | `tests/test_homelab.py` | 插件测试，单独运行，不改上游的 `tests/run_all.py` |
 
 容器更新的 Telegram 通知：`telegram()` 遇到断连、超时、429/5xx 会再试两次；「正在更新」「已更新」「已清理」和各项「未完成」汇总这类只告知结果的消息走 `tell()`，发不出去只记日志，不改变更新或清理的状态。2026-10-22 rsshub 的自动更新其实成功了，只是那条通知赶上连接断开，被标成 failed、报了「更新未完成」，回退容器也不会被清理；这类记录（failed 但带 `applied` / `new_id`）的回退容器现在照常在 2 天后清理。
+
+## 容器更新策略（2026-11-01）
+
+默认自动：每日 03:30 的 `--scan` 找到新镜像后，除下列情况外都在检查末尾直接更新（校验镜像、等健康、
+失败恢复旧容器，回退容器保留 2 天）。
+
+- `DCB-Auto-Update=false`：只通知，保留上游 `=false` 的语义；空值或 `true` 仍是显式开启。
+- `DCB-Ignore-Check-Updates`：完全不查这个容器。
+- `homelab.update.exclude=1`：同上，完全不查。
+- 数据库不自动跨大版本：名字命中 `n8n-postgres`、`ghost-db`、`paperless-redis`，或镜像家族命中
+  postgres/mysql/mariadb/mongo/redis/valkey/clickhouse/influxdb/couchdb 的容器，照常查新并发按钮，
+  但不会自动更新；确需自动的在 compose 上加 `DCB-Auto-Update: "true"` 单独放开。
+- `daidai-panel` 交给 Watchtower（每小时），插件不自动更新它，避免两套更新器互相覆盖。
+- `docker-controller-bot`、`portainer`、`portainer_edge_agent`、`n8n-postgres`、本地构建镜像
+  （`local/*`、`homelab/*`、`:local`）、回退容器、停止的容器、共享命名空间、固定摘要：一律不自动。
+- 新增的容器同样按上面的默认处理，不需要逐个打标签。
+
+策略放在数据卷的 `docker-update-policy.json`（不在仓库里，升级镜像不会丢），可写：
+
+```json
+{"default": "announce",
+ "database_names": ["my-app-db"],
+ "database_images": ["postgres"],
+ "watchtower_managed": ["some-panel"]}
+```
+
+`default` 写 `announce` 就把默认退回「只通知」；三个列表是**追加**到内置保护项，不会删掉任何保护。
+文件缺失或读不出时按 `auto` 运行。
 
 ## 更新流程
 

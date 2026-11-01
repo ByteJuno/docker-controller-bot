@@ -1,0 +1,6 @@
+{
+  "default": "auto",
+  "database_names": ["my-app-db"],
+  "database_images": ["postgres", "mysql", "redis"],
+  "watchtower_managed": ["some-panel"]
+}

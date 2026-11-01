@@ -17,6 +17,18 @@ PROTECTED={'docker-controller-bot':'定制机器人需合并代码更新','porta
 # 它每次都要拉镜像、4.2.0 只管本机，也没有健康检查和回退。这里的流程与手动确认完全相同
 # （校验镜像、等健康、失败恢复旧容器、旧容器保留 2 天）；某个版本自动更新失败后不再重试，改发确认按钮。
 AUTO_LABEL='DCB-Auto-Update'
+# 默认策略（2026-11-01）：没有特殊标签的容器发现新镜像后，在每日检查末尾直接更新。
+# 下面这些保护项照常查新，只是不自动更新、改发确认按钮：
+#   · 数据库不自动跨大版本：名字或镜像家族命中即保守排除，需要时用 DCB-Auto-Update=true 单独放开；
+#   · 由 Watchtower 接管的容器不参与，免得两套更新器互相覆盖；
+#   · DCB-Auto-Update=false 保持上游语义：这个容器只通知。
+# 策略文件在数据卷里（docker-update-policy.json），升级镜像不会丢；读不出时按这里的默认值运行。
+IGNORE_LABEL='DCB-Ignore-Check-Updates'
+DATABASE_NAMES={'n8n-postgres','ghost-db','paperless-redis'}
+DATABASE_IMAGES=('postgres','postgresql','mysql','mariadb','mongo','mongodb','redis','valkey',
+                 'clickhouse','influxdb','couchdb')
+WATCHTOWER_MANAGED={'daidai-panel'}
+POLICY_FILE='docker-update-policy.json'
 ACCEPT=', '.join(['application/vnd.oci.image.index.v1+json','application/vnd.docker.distribution.manifest.list.v2+json',
                  'application/vnd.oci.image.manifest.v1+json','application/vnd.docker.distribution.manifest.v2+json'])
 
@@ -115,6 +127,48 @@ def tell(text,chat=None):
     try:return telegram(text,chat=chat)
     except Exception as ex:print('Telegram 通知未发出（'+type(ex).__name__+'）：'+text.split('\n',1)[0],file=sys.stderr,flush=True)
 
+def _label_on(value):
+    """上游语义：空值算开启，false/0/no/off 才算关闭。"""
+    return str(value).strip().lower() not in ('0','false','no','off')
+
+def image_repository(ref):
+    """镜像引用里的仓库名，去掉 registry、tag 和 digest，用来认出数据库镜像。"""
+    name=ref.split('@',1)[0].rsplit('/',1)[-1]
+    return name.split(':',1)[0].lower()
+
+def policy():
+    """默认更新策略：数据卷里的 POLICY_FILE 覆盖/追加默认值，读不出就全用默认（全部自动）。
+
+    {"default": "auto"|"announce", "database_names": [...], "database_images": [...],
+     "watchtower_managed": [...]}，列表是追加，不是替换：写错或删掉都只会回到更保守的默认。"""
+    result={'default':'auto','database_names':set(DATABASE_NAMES),
+            'database_images':set(DATABASE_IMAGES),'watchtower_managed':set(WATCHTOWER_MANAGED)}
+    try:
+        stored=json.loads(homelab_paths.data_file(POLICY_FILE).read_text())
+    except (OSError,ValueError):
+        return result
+    if not isinstance(stored,dict):return result
+    if str(stored.get('default','')).strip().lower()=='announce':result['default']='announce'
+    for key in ('database_names','database_images','watchtower_managed'):
+        extra=stored.get(key)
+        if isinstance(extra,list):
+            result[key]|={str(item).strip() for item in extra if str(item).strip()}
+    return result
+
+def auto_reason(c,settings):
+    """None：这个容器按默认策略自动更新。否则返回不自动的原因（仍然查新、仍然发确认按钮）。
+
+    标签优先：显式 DCB-Auto-Update=true 连数据库也照做，显式 false 连普通容器也只通知。"""
+    labels=c['Config'].get('Labels') or {}
+    if AUTO_LABEL in labels:return None if _label_on(labels[AUTO_LABEL]) else '标签 DCB-Auto-Update=false'
+    if settings['default']!='auto':return '策略设为只通知'
+    name=c['Name'].lstrip('/')
+    if name in settings['database_names']:return '数据库不自动跨大版本'
+    ref=labels.get('homelab.update.image') or c['Config']['Image']
+    if image_repository(ref) in settings['database_images']:return '数据库不自动跨大版本'
+    if name in settings['watchtower_managed']:return '由 Watchtower 负责'
+    return None
+
 def exclusion(c):
     name=c['Name'].lstrip('/');labels=c['Config'].get('Labels') or {};ref=labels.get('homelab.update.image') or c['Config']['Image']
     if '.__rollback__.' in name:return '保留的回退容器'
@@ -124,6 +178,7 @@ def exclusion(c):
     # course-platform:local 这种「:local」标签同理（Osaka Lab 本机构建，每天检查都报 HTTPError，2026-10-03 加）。
     if ref.startswith(('homelab/','local/')) or ref.endswith(':local'):return '本地构建镜像，不追踪仓库标签'
     if labels.get('homelab.update.exclude','').lower() in ('1','true'):return '已设置忽略'
+    if IGNORE_LABEL in labels and _label_on(labels[IGNORE_LABEL]):return '标签 DCB-Ignore-Check-Updates'
     if c['State']['Status']!='running':return '仅检查运行中的服务'
     h=c['HostConfig']
     if any(str(h.get(k,'')).startswith('container:') for k in ('NetworkMode','PidMode','IpcMode')):return '共享容器命名空间需手动维护'
@@ -136,7 +191,7 @@ def scan(notify=True):
     with open(ROOT/'scan.lock','w') as lock:
         try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         except BlockingIOError:return {'busy':True}
-        cache={};autos=[]
+        cache={};autos=[];settings=policy()
         for eid,label in api.envs.items():
             try:containers=api.call(eid,'/containers/json?all=1')
             except Exception as ex:result['errors'].append(label+'：环境不可达');continue
@@ -165,7 +220,7 @@ def scan(notify=True):
                             conn.execute('INSERT INTO candidates VALUES (?,?,?,?,?,?,?,?)',(ident,eid,c['Id'],target['config'],json.dumps(pending),'pending',time.time()+72*3600,0))
                         failed=conn.execute("SELECT 1 FROM candidates WHERE eid=? AND cid=? AND target=? AND status='failed'",(eid,c['Id'],target['config'])).fetchone()
                         data=json.loads(conn.execute('SELECT data FROM candidates WHERE id=?',(ident,)).fetchone()[0])
-                    if AUTO_LABEL in (c['Config'].get('Labels') or {}) and not failed:
+                    if not failed and auto_reason(c,settings) is None:
                         if notify:autos.append((ident,data))
                         continue
                     if notify and not sent:
