@@ -7,6 +7,7 @@
 | `homelab/main.py` | 镜像入口：把上游的 `docker-controller-bot.py` 当模块加载（命令和回调就注册好了），再装插件、启动 |
 | `homelab/plugins.py` | 把插件装到上游的 bot 上，并挪到上游兜底处理函数的前面；命令菜单里加 `/status` |
 | `homelab/docker_updates.py` | 经 Portainer 查新、默认自动更新（opt-out），保留回退容器 2 天，清理构建缓存（每天 03:30 由外部触发 `--scan`） |
+| `homelab/policy.py` | 读取/校验/原子保存 `docker-update-policy.json`，并提供 `python3 -m homelab.policy` 维护入口 |
 | `homelab/n8n_status.py` | `/status`：转发给 n8n 的主机状态报告 |
 | `homelab/self_update.py` | 机器人自己的更新（见下） |
 | `homelab/paths.py` | 插件文件放在 bot 的数据卷里（5.x 是 `/app/config`） |
@@ -41,7 +42,22 @@
 ```
 
 `default` 写 `announce` 就把默认退回「只通知」；三个列表是**追加**到内置保护项，不会删掉任何保护。
-文件缺失或读不出时按 `auto` 运行。
+
+文件缺失时按 `auto` 运行。文件存在但损坏（不是有效 JSON）、无权限读取、顶层不是对象，或 `default`/列表类型不对时，
+不再静默按 `auto`：整轮检查改为只通知（不自动更新，连 `DCB-Auto-Update=true` 也暂不生效），并给管理员发一次告警；
+修好后下一次检查自动恢复。告警按问题去重，不会每天重复。
+
+改策略用内置工具（校验 + 同目录临时文件 + `fsync` + `os.replace` 原子替换，权限 0600），不要手工改 JSON：
+
+```bash
+docker exec docker-controller-bot python3 -m homelab.policy --show
+docker exec docker-controller-bot python3 -m homelab.policy --set-default announce
+docker exec docker-controller-bot python3 -m homelab.policy --add-database-name my-app-db
+docker exec docker-controller-bot python3 -m homelab.policy --add-watchtower some-panel
+docker exec docker-controller-bot python3 -m homelab.policy --remove-database-name my-app-db
+```
+
+文件已经损坏时工具会拒绝覆盖；确认要重写时加 `--replace`。工具只改自定义追加项，不会删除内置保护。
 
 ## 更新流程
 

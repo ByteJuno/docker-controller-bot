@@ -6,6 +6,7 @@ if __package__ in (None, ""):
     # Run as a script (python3 /app/homelab/docker_updates.py --scan): make the package importable.
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from homelab import paths as homelab_paths
+from homelab import policy as policy_file
 from datetime import datetime, timezone
 
 ROOT=pathlib.Path(os.environ.get('UPDATE_STATE_DIR') or homelab_paths.data_file('image-updates'))
@@ -22,13 +23,14 @@ AUTO_LABEL='DCB-Auto-Update'
 #   · 数据库不自动跨大版本：名字或镜像家族命中即保守排除，需要时用 DCB-Auto-Update=true 单独放开；
 #   · 由 Watchtower 接管的容器不参与，免得两套更新器互相覆盖；
 #   · DCB-Auto-Update=false 保持上游语义：这个容器只通知。
-# 策略文件在数据卷里（docker-update-policy.json），升级镜像不会丢；读不出时按这里的默认值运行。
+# 策略文件在数据卷里（docker-update-policy.json），升级镜像不会丢；文件缺失时按这里的默认 auto 运行。
+# 文件存在但损坏、无权限或类型不对时，不再静默按 auto：整轮改为只检查（announce）并给管理员发一次告警。
 IGNORE_LABEL='DCB-Ignore-Check-Updates'
-DATABASE_NAMES={'n8n-postgres','ghost-db','paperless-redis'}
-DATABASE_IMAGES=('postgres','postgresql','mysql','mariadb','mongo','mongodb','redis','valkey',
-                 'clickhouse','influxdb','couchdb')
-WATCHTOWER_MANAGED={'daidai-panel'}
-POLICY_FILE='docker-update-policy.json'
+DATABASE_NAMES=set(policy_file.DEFAULT_DATABASE_NAMES)
+DATABASE_IMAGES=policy_file.DEFAULT_DATABASE_IMAGES
+WATCHTOWER_MANAGED=set(policy_file.DEFAULT_WATCHTOWER_MANAGED)
+POLICY_FILE=policy_file.FILENAME
+POLICY_ALERT_FILE='policy-alert.json'
 ACCEPT=', '.join(['application/vnd.oci.image.index.v1+json','application/vnd.docker.distribution.manifest.list.v2+json',
                  'application/vnd.oci.image.manifest.v1+json','application/vnd.docker.distribution.manifest.v2+json'])
 
@@ -127,6 +129,32 @@ def tell(text,chat=None):
     try:return telegram(text,chat=chat)
     except Exception as ex:print('Telegram 通知未发出（'+type(ex).__name__+'）：'+text.split('\n',1)[0],file=sys.stderr,flush=True)
 
+def _alert_state():
+    try:return json.loads((ROOT/POLICY_ALERT_FILE).read_text())
+    except (OSError,ValueError):return {}
+
+def _save_alert_state(state):
+    # 告警去重状态不是策略文件；写失败只会让告警下次再发，不影响扫描。
+    tmp=ROOT/(POLICY_ALERT_FILE+'.tmp')
+    try:
+        tmp.write_text(json.dumps(state,ensure_ascii=False))
+        tmp.chmod(0o600);tmp.replace(ROOT/POLICY_ALERT_FILE)
+    except OSError:pass
+
+def notify_policy_problem(settings):
+    """策略文件异常/恢复时给管理员发一次告警；同一问题每天不重复。"""
+    problem=settings.get('problem');state=_alert_state();previous=state.get('problem')
+    if problem==previous:return
+    if problem:
+        text=('⚠️ Baihaha，Docker 更新策略文件异常，已改为只检查（不会自动更新）\n'
+              '文件：'+POLICY_FILE+'\n原因：'+problem+'\n'
+              '修好后下次检查恢复正常；本轮仍照常查新，确认按钮仍会发送。')
+    else:text='✅ Docker 更新策略文件已恢复正常，自动更新策略重新生效。'
+    try:telegram(text)
+    except Exception as ex:
+        print('策略告警未发出（'+type(ex).__name__+'）',file=sys.stderr,flush=True);return
+    _save_alert_state({'problem':problem} if problem else {})
+
 def _label_on(value):
     """上游语义：空值算开启，false/0/no/off 才算关闭。"""
     return str(value).strip().lower() not in ('0','false','no','off')
@@ -137,29 +165,23 @@ def image_repository(ref):
     return name.split(':',1)[0].lower()
 
 def policy():
-    """默认更新策略：数据卷里的 POLICY_FILE 覆盖/追加默认值，读不出就全用默认（全部自动）。
+    """Effective policy from the data volume.
 
-    {"default": "auto"|"announce", "database_names": [...], "database_images": [...],
-     "watchtower_managed": [...]}，列表是追加，不是替换：写错或删掉都只会回到更保守的默认。"""
-    result={'default':'auto','database_names':set(DATABASE_NAMES),
-            'database_images':set(DATABASE_IMAGES),'watchtower_managed':set(WATCHTOWER_MANAGED)}
-    try:
-        stored=json.loads(homelab_paths.data_file(POLICY_FILE).read_text())
-    except (OSError,ValueError):
-        return result
-    if not isinstance(stored,dict):return result
-    if str(stored.get('default','')).strip().lower()=='announce':result['default']='announce'
-    for key in ('database_names','database_images','watchtower_managed'):
-        extra=stored.get(key)
-        if isinstance(extra,list):
-            result[key]|={str(item).strip() for item in extra if str(item).strip()}
-    return result
+    A missing file keeps the code default (auto). A file that exists but is
+    unreadable, invalid or has the wrong shape becomes announce and carries a
+    ``problem``; the scan alerts once and never auto-updates from a damaged
+    policy. The file is handled by homelab.policy, which also owns the
+    atomic save tool.
+    """
+    return policy_file.load()
 
 def auto_reason(c,settings):
     """None：这个容器按默认策略自动更新。否则返回不自动的原因（仍然查新、仍然发确认按钮）。
 
-    标签优先：显式 DCB-Auto-Update=true 连数据库也照做，显式 false 连普通容器也只通知。"""
+    标签优先：显式 DCB-Auto-Update=true 连数据库也照做，显式 false 连普通容器也只通知。
+    策略文件损坏时整轮只检查：连显式 true 也暂不自动更新，直到文件修好。"""
     labels=c['Config'].get('Labels') or {}
+    if settings.get('problem'):return '策略文件异常，仅检查'
     if AUTO_LABEL in labels:return None if _label_on(labels[AUTO_LABEL]) else '标签 DCB-Auto-Update=false'
     if settings['default']!='auto':return '策略设为只通知'
     name=c['Name'].lstrip('/')
@@ -191,7 +213,10 @@ def scan(notify=True):
     with open(ROOT/'scan.lock','w') as lock:
         try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         except BlockingIOError:return {'busy':True}
-        cache={};autos=[];settings=policy()
+        cache={};autos=[];settings=policy();would_auto=0
+        result['policy']={'source':settings.get('source','unknown')}
+        if settings.get('problem'):result['policy']['problem']=settings['problem']
+        if notify:notify_policy_problem(settings)
         for eid,label in api.envs.items():
             try:containers=api.call(eid,'/containers/json?all=1')
             except Exception as ex:result['errors'].append(label+'：环境不可达');continue
@@ -221,6 +246,7 @@ def scan(notify=True):
                         failed=conn.execute("SELECT 1 FROM candidates WHERE eid=? AND cid=? AND target=? AND status='failed'",(eid,c['Id'],target['config'])).fetchone()
                         data=json.loads(conn.execute('SELECT data FROM candidates WHERE id=?',(ident,)).fetchone()[0])
                     if not failed and auto_reason(c,settings) is None:
+                        would_auto+=1
                         if notify:autos.append((ident,data))
                         continue
                     if notify and not sent:
@@ -234,7 +260,7 @@ def scan(notify=True):
         for ident,p in autos:
             with db() as conn:conn.execute("UPDATE candidates SET status='approved' WHERE id=? AND status='pending'",(ident,))
             worker(ident,p,None,auto=True)
-        result['auto']=len(autos)
+        result['auto']=len(autos);result['would_auto']=would_auto
         result['cleanup']=scan_cleanup(api,notify)
         result['images']=prune_images(api,notify)
         result['build_cache']=prune_build_cache(api,notify)

@@ -8,9 +8,14 @@ plugin handlers still win over the core's catch-alls, that /status and
 the update buttons reach the plugins, that the command menu carries them, and
 that only administrators get through.
 """
+import contextlib
+import io
 import json
 import os
+import pathlib
+import shutil
 import sys
+import tempfile
 import types
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -282,6 +287,283 @@ def test_the_policy_file_can_turn_the_default_off():
 	# Without the file the code default is back: automatic again.
 	assert du.auto_reason(plain, du.policy()) is None
 
+
+import pathlib
+import tempfile
+import shutil
+import io
+import contextlib
+
+
+def _policy_tmpdir():
+    return pathlib.Path(tempfile.mkdtemp(prefix="dcb-policy-"))
+
+
+def test_a_missing_policy_file_keeps_the_default_auto():
+    from homelab import docker_updates as du
+    tmp = _policy_tmpdir()
+    old_env, old_root = os.environ.get("HOMELAB_DATA_DIR"), du.ROOT
+    os.environ["HOMELAB_DATA_DIR"] = str(tmp)
+    du.ROOT = tmp
+    try:
+        settings = du.policy()
+        assert settings["default"] == "auto", settings
+        assert settings.get("problem") is None, settings
+        assert du.auto_reason(container("rsshub", "diygod/rsshub:latest"), settings) is None
+    finally:
+        du.ROOT = old_root
+        if old_env is None:
+            os.environ.pop("HOMELAB_DATA_DIR", None)
+        else:
+            os.environ["HOMELAB_DATA_DIR"] = old_env
+        shutil.rmtree(tmp)
+
+
+def test_a_damaged_policy_only_checks_and_still_scans():
+    from homelab import docker_updates as du
+    tmp = _policy_tmpdir()
+    old_env, old_root = os.environ.get("HOMELAB_DATA_DIR"), du.ROOT
+    os.environ["HOMELAB_DATA_DIR"] = str(tmp)
+    du.ROOT = tmp
+    try:
+        bad = ("{not json", "[]", '{"default":"annouce"}', '{"default":1}',
+               '{"database_names":"x"}', '{"database_names":[1]}')
+        for text in bad:
+            (tmp / du.POLICY_FILE).write_text(text)
+            settings = du.policy()
+            assert settings["default"] == "announce", (text, settings)
+            assert settings.get("problem"), (text, settings)
+            plain = container("rsshub", "diygod/rsshub:latest")
+            assert du.auto_reason(plain, settings) == "策略文件异常，仅检查"
+            # A damaged policy is a global stop: even an explicit true waits
+            # until the file is fixed. The container is still checked.
+            explicit = container("ghost-db", "mysql:8.4.10", {du.AUTO_LABEL: "true"})
+            assert du.auto_reason(explicit, settings) == "策略文件异常，仅检查"
+            assert du.exclusion(plain) is None
+    finally:
+        du.ROOT = old_root
+        if old_env is None:
+            os.environ.pop("HOMELAB_DATA_DIR", None)
+        else:
+            os.environ["HOMELAB_DATA_DIR"] = old_env
+        shutil.rmtree(tmp)
+
+
+def test_an_unreadable_or_dangling_policy_only_checks():
+    from homelab import docker_updates as du
+    from homelab import policy as policy_file
+    tmp = _policy_tmpdir()
+    old_env, old_root = os.environ.get("HOMELAB_DATA_DIR"), du.ROOT
+    os.environ["HOMELAB_DATA_DIR"] = str(tmp)
+    du.ROOT = tmp
+    target = tmp / du.POLICY_FILE
+    original_read = policy_file._read_text
+    try:
+        target.write_text('{"default":"auto"}')
+        policy_file._read_text = lambda _: (_ for _ in ()).throw(PermissionError(13, "denied"))
+        try:
+            settings = du.policy()
+        finally:
+            policy_file._read_text = original_read
+        assert settings["default"] == "announce", settings
+        assert "无法读取" in settings["problem"], settings
+
+        target.unlink()
+        try:
+            target.symlink_to(tmp / "missing.json")
+        except (OSError, NotImplementedError):
+            pass
+        else:
+            settings = du.policy()
+            assert settings["default"] == "announce", settings
+            assert "符号链接" in settings["problem"], settings
+    finally:
+        du.ROOT = old_root
+        if old_env is None:
+            os.environ.pop("HOMELAB_DATA_DIR", None)
+        else:
+            os.environ["HOMELAB_DATA_DIR"] = old_env
+        shutil.rmtree(tmp)
+
+
+def test_policy_alert_is_sent_once_and_recovery_is_reported():
+    from homelab import docker_updates as du
+    tmp = _policy_tmpdir()
+    old_env, old_root, old_telegram = os.environ.get("HOMELAB_DATA_DIR"), du.ROOT, du.telegram
+    os.environ["HOMELAB_DATA_DIR"] = str(tmp)
+    du.ROOT = tmp
+    sent = []
+    du.telegram = lambda text, buttons=None, chat=None: sent.append(text) or 7
+    try:
+        (tmp / du.POLICY_FILE).write_text("{bad")
+        du.notify_policy_problem(du.policy())
+        du.notify_policy_problem(du.policy())
+        assert len(sent) == 1, sent
+        assert "Baihaha" in sent[0] and "策略文件异常" in sent[0], sent[0]
+
+        (tmp / du.POLICY_FILE).unlink()
+        du.notify_policy_problem(du.policy())
+        assert len(sent) == 2, sent
+        assert "恢复正常" in sent[1], sent[1]
+    finally:
+        du.ROOT = old_root
+        du.telegram = old_telegram
+        if old_env is None:
+            os.environ.pop("HOMELAB_DATA_DIR", None)
+        else:
+            os.environ["HOMELAB_DATA_DIR"] = old_env
+        shutil.rmtree(tmp)
+
+
+def test_a_damaged_policy_never_auto_updates_in_scan():
+    from homelab import docker_updates as du
+    tmp = _policy_tmpdir()
+    old_env, old_root = os.environ.get("HOMELAB_DATA_DIR"), du.ROOT
+    os.environ["HOMELAB_DATA_DIR"] = str(tmp)
+    du.ROOT = tmp
+    (tmp / du.POLICY_FILE).write_text("{bad")
+
+    class FakeAPI:
+        envs = {3: "Docker-VM"}
+
+        def call(self, eid, path, method="GET", data=None, raw=False, timeout=90):
+            if path.startswith("/containers/json"):
+                return [{"Id": "c1", "Names": ["/rsshub"]}]
+            if path == "/containers/c1/json":
+                return container("rsshub", "diygod/rsshub:latest")
+            if path.startswith("/images/"):
+                return {"Id": "sha256:" + "a" * 64, "Architecture": "amd64",
+                        "Os": "linux", "Variant": ""}
+            raise AssertionError(path)
+
+    sent, workers = [], []
+    originals = (du.API, du.resolve_image, du.scan_cleanup, du.prune_images,
+                 du.prune_build_cache, du.worker, du.telegram)
+    du.API = FakeAPI
+    du.resolve_image = lambda api, eid, ref, local: {
+        "config": "sha256:" + "b" * 64, "digest": "sha256:" + "c" * 64,
+        "ref": ref, "platform": "amd64"}
+    du.scan_cleanup = lambda api, notify=True: {"stub": True}
+    du.prune_images = lambda api, notify=True: {"stub": True}
+    du.prune_build_cache = lambda api, notify=True: {"stub": True}
+    du.worker = lambda *args, **kwargs: workers.append((args, kwargs))
+    du.telegram = lambda text, buttons=None, chat=None: sent.append(text) or 7
+    try:
+        result = du.scan(notify=True)
+        assert result["checked"] == 1, result
+        assert result["updates"] == 1, result
+        assert result["would_auto"] == 0, result
+        assert result["auto"] == 0, result
+        assert result["policy"]["problem"], result
+        assert workers == [], workers
+        assert any("策略文件异常" in text for text in sent), sent
+        first = len(sent)
+        du.scan(notify=True)
+        assert len(sent) == first, sent
+    finally:
+        (du.API, du.resolve_image, du.scan_cleanup, du.prune_images,
+         du.prune_build_cache, du.worker, du.telegram) = originals
+        du.ROOT = old_root
+        if old_env is None:
+            os.environ.pop("HOMELAB_DATA_DIR", None)
+        else:
+            os.environ["HOMELAB_DATA_DIR"] = old_env
+        shutil.rmtree(tmp)
+
+
+def test_the_policy_tool_saves_atomically_and_refuses_damage():
+    from homelab import policy as policy_file
+    tmp = _policy_tmpdir()
+    target = tmp / policy_file.FILENAME
+    original = policy_file.path
+    policy_file.path = lambda: target
+    try:
+        policy_file.save({"default": "announce", "database_names": ["custom-db"]})
+        stored = json.loads(target.read_text())
+        assert stored["default"] == "announce"
+        assert stored["database_names"] == ["custom-db"]
+        assert (target.stat().st_mode & 0o777) == 0o600
+        assert not list(tmp.glob(".*.tmp"))
+        settings = policy_file.load()
+        assert settings["default"] == "announce"
+        assert "custom-db" in settings["database_names"]
+
+        for bad in ({"default": "bogus"}, {"database_names": "x"}, []):
+            try:
+                policy_file.save(bad)
+            except policy_file.Problem:
+                pass
+            else:
+                raise AssertionError(bad)
+
+        target.write_text("{bad")
+        try:
+            policy_file.save({"default": "auto"})
+        except policy_file.Problem:
+            pass
+        else:
+            raise AssertionError("overwrote a damaged policy without replace")
+        policy_file.save({"default": "auto"}, replace=True)
+        assert json.loads(target.read_text())["default"] == "auto"
+    finally:
+        policy_file.path = original
+        shutil.rmtree(tmp)
+
+
+def test_a_failed_policy_save_leaves_the_old_file():
+    from homelab import policy as policy_file
+    tmp = _policy_tmpdir()
+    target = tmp / policy_file.FILENAME
+    original_path, original_replace = policy_file.path, policy_file.os.replace
+    policy_file.path = lambda: target
+    try:
+        target.write_text('{"default": "announce"}')
+        policy_file.os.replace = lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk full"))
+        try:
+            policy_file.save({"default": "auto"})
+        except OSError:
+            pass
+        else:
+            raise AssertionError("save should have failed")
+        assert json.loads(target.read_text())["default"] == "announce"
+        assert not list(tmp.glob(".*.tmp"))
+    finally:
+        policy_file.path, policy_file.os.replace = original_path, original_replace
+        shutil.rmtree(tmp)
+
+
+def test_the_policy_tool_cli_keeps_unknown_keys_and_validates():
+    from homelab import policy as policy_file
+    tmp = _policy_tmpdir()
+    target = tmp / policy_file.FILENAME
+    original = policy_file.path
+    policy_file.path = lambda: target
+    out = io.StringIO()
+    try:
+        target.write_text(json.dumps({"default": "auto", "future": {"keep": 1},
+                                      "database_names": ["custom-db"]}))
+        with contextlib.redirect_stdout(out):
+            assert policy_file.main(["--set-default", "announce",
+                                     "--add-watchtower", "other-panel"]) == 0
+        stored = json.loads(target.read_text())
+        assert stored["default"] == "announce"
+        assert stored["future"] == {"keep": 1}
+        assert "other-panel" in stored["watchtower_managed"]
+
+        with contextlib.redirect_stdout(out):
+            assert policy_file.main(["--remove-database-name", "custom-db"]) == 0
+        assert "custom-db" not in json.loads(target.read_text())["database_names"]
+
+        target.write_text("{bad")
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            assert policy_file.main(["--set-default", "auto"]) == 2
+        assert target.read_text() == "{bad"
+        with contextlib.redirect_stdout(out):
+            assert policy_file.main(["--set-default", "auto", "--replace"]) == 0
+        assert json.loads(target.read_text())["default"] == "auto"
+    finally:
+        policy_file.path = original
+        shutil.rmtree(tmp)
 
 if __name__ == "__main__":
 	failed = 0
