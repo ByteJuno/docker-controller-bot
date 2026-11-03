@@ -168,7 +168,7 @@ Most commands can be used in two ways: typing the command alone (`/run`) to let 
 | `/mute <minutes>` | Mute notifications for a number of minutes |
 | `/schedule` | Menu to create, edit and delete scheduled tasks |
 | `/settings` | Bot settings: language, columns, update checking, notification channel and **Docker hosts** |
-| `/version` `/donate` `/donors` | Current version / donate / list of donors |
+| `/version` `/donate` | Current version / donate to this fork's maintainer |
 
 <details>
 <summary>🧩 My containers were created with <code>docker compose</code>, how do they look?</summary>

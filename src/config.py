@@ -94,7 +94,6 @@ LANGUAGE_NAMES = {
     "IT": "Italiano",
     "CAT": "Català",
 }
-DONORS_URL = "https://donate.dgongut.com/donors.json"
 ICON_CONTAINER_MARK_FOR_UPDATE = "➕"
 ICON_CONTAINER_MARKED_FOR_UPDATE = "✅"
 ICON_CONTAINER_ACTION_DONE = "✅"

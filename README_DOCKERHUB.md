@@ -105,7 +105,7 @@ Casi todos funcionan de dos formas: escribe el comando solo (`/run`) y el bot te
 | `/mute <minutos>` | Silencia las notificaciones durante X minutos |
 | `/schedule` | Crea, edita y borra tareas programadas |
 | `/settings` | Ajustes del bot y hosts de Docker |
-| `/version` `/donate` `/donors` | Versión / donar / donantes |
+| `/version` `/donate` | Versión / donar |
 
 ---
 

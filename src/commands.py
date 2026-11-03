@@ -24,7 +24,7 @@ from core import (
 	compose, confirm_delete, create_simple_keyboard,
 	delete_message_later, display_all_hosts, send_split_message,
 	info, log_file, logs,
-	mute, print_donors, restart,
+	mute, restart,
 	run, save_container_refs, save_update_data,
 	send_message, send_settings_menu,
 	send_ports_menu,
@@ -153,8 +153,6 @@ def cmd_version(user_id=None, chat_id=None, container_id=None, container_name=No
 def cmd_donate(user_id=None, chat_id=None, container_id=None, container_name=None, argument=None):
 	delete_message_later(send_message(message=get_text("donate")), 45)
 
-def cmd_donors(user_id=None, chat_id=None, container_id=None, container_name=None, argument=None):
-	print_donors()
 
 def cmd_ports(user_id=None, chat_id=None, container_id=None, container_name=None, argument=None):
 	send_ports_menu()
@@ -204,6 +202,5 @@ for _name, _action in {
 	"/settings": cmd_settings,
 	"/version": cmd_version,
 	"/donate": cmd_donate,
-	"/donors": cmd_donors,
 }.items():
 	register_command(_name, _action)
