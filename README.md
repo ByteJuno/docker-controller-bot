@@ -168,7 +168,7 @@ Casi todos funcionan de dos formas: escribe el comando solo (`/run`) y el bot te
 | `/mute <minutos>` | Silencia las notificaciones durante X minutos |
 | `/schedule` | Menú para crear, editar y borrar tareas programadas |
 | `/settings` | Ajustes del bot: idioma, columnas, comprobación de actualizaciones, canal de notificaciones y **hosts de Docker** |
-| `/version` `/donate` `/donors` | Versión actual / donar / lista de donantes |
+| `/version` `/donate` | Versión actual / donar al mantenedor de este fork |
 
 <details>
 <summary>🧩 Mis contenedores son de <code>docker compose</code>, ¿cómo se ven?</summary>

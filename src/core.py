@@ -3514,7 +3514,7 @@ START_CATEGORY_COMMANDS = {
 	"updates": ("checkupdate", "updateall", "changetag"),
 	"system": ("prune", "ports", "compose"),
 	"automation": ("schedule", "mute"),
-	"about": ("version", "donate", "donors"),
+	"about": ("version", "donate"),
 }
 
 # The first screen, in order. A category opens a submenu; a command runs
@@ -3762,7 +3762,7 @@ def parse_command(text):
 	command, _, addressee = first.partition("@")
 	return command, addressee
 
-@bot.message_handler(commands=["start", "list", "run", "stop", "restart", "delete", "exec", "checkupdate", "updateall", "changetag", "logs", "logfile", "compose", "mute", "schedule", "settings", "info", "version", "donate", "donors", "prune", "ports"])
+@bot.message_handler(commands=["start", "list", "run", "stop", "restart", "delete", "exec", "checkupdate", "updateall", "changetag", "logs", "logfile", "compose", "mute", "schedule", "settings", "info", "version", "donate", "prune", "ports"])
 @with_reply_context
 def command_controller(message):
 	userId = message.from_user.id
@@ -8348,45 +8348,6 @@ def check_specific_port(port_number, host_id=None):
 	else:
 		return is_available, get_text(message_key, port_number)
 
-def print_donors():
-	donors = get_array_donors_online()
-	if donors:
-		result = ""
-		for donor in donors:
-			result += f"· {html.escape(str(donor))}\n"
-		send_message(message=get_text("donors_list", result))
-	else:
-		send_message(message=get_text("error_getting_donors"))
-
-def get_array_donors_online():
-	headers = {
-		'Cache-Control': 'no-cache',
-		'Pragma': 'no-cache'
-	}
-
-	# With a deadline and its failures caught, like every other request the
-	# bot makes: a server that accepted the connection and never answered
-	# held the worker for good, and a network error reached nobody.
-	try:
-		response = requests.get(DONORS_URL, headers=headers, timeout=10)
-	except requests.RequestException as e:
-		error(f"Error getting donors: {e}")
-		return []
-	if response.status_code == 200:
-		try:
-			data = response.json()
-			if isinstance(data, list):
-				return sorted(data, key=str)
-			else:
-				error(f"Error getting donors: data is not a list [{str(data)}]")
-				return []
-		except ValueError:
-			error(f"Error getting donors: data is not a json [{response.text}]")
-			return []
-	else:
-		error(f"Error getting donors: error code [{response.status_code}]")
-		return []
-
 # --- REFERENCIAS DE CONTENEDOR -------------------------------------------
 #
 # A container is identified by which host it is on plus its short id, because
@@ -10053,8 +10014,7 @@ def register_bot_commands():
 		telebot.types.BotCommand("/info", get_text("menu_info")),
 		telebot.types.BotCommand("/ports", get_text("menu_ports")),
 		telebot.types.BotCommand("/version", get_text("menu_version")),
-		telebot.types.BotCommand("/donate", get_text("menu_donate")),
-		telebot.types.BotCommand("/donors", get_text("menu_donors"))
+		telebot.types.BotCommand("/donate", get_text("menu_donate"))
 		])
 
 
