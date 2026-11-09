@@ -802,12 +802,15 @@ services:
   ports:
     <<: *base
     container_name: {PREFIX}ports
+    # Below 32768, out of Linux's ephemeral range: in it, any outgoing
+    # connection on the runner could hold one, and compose failed with
+    # "address already in use".
     ports:
-      - "127.0.0.1:55101-55103:8001-8003"
-      - "55104:80"
-      - "55105:80"
-      - "55106:53/udp"
-      - "55106:53/tcp"
+      - "127.0.0.1:25101-25103:8001-8003"
+      - "25104:80"
+      - "25105:80"
+      - "25106:53/udp"
+      - "25106:53/tcp"
   v6:
     <<: *base
     container_name: {PREFIX}v6
@@ -1132,6 +1135,52 @@ def test_a_batch_with_a_vpn_and_what_runs_behind_it_updates_both():
 		cleanup()
 
 
+def test_a_batch_deletes_the_old_image_its_containers_shared_once_it_is_over():
+	"""
+	Deleted at the end of each update, the old image held the batch up on a
+	slow disk: Docker took longer than the client's thirty seconds, and the
+	next update hung behind it. It is deleted now once the batch is over, in
+	the background — once, though both containers ran it: the first update's
+	attempt failed before, the second one still used it.
+	"""
+	_setup()
+	core, sent = _load()
+	real_perform = core.perform_container_update
+
+	def present(image_id):
+		try:
+			client.images.get(image_id)
+			return True
+		except docker.errors.ImageNotFound:
+			return False
+
+	try:
+		core.store.set("bot.extended_messages", False)
+		old = publish("7.0")
+		first, second = run("img-a"), run("img-b")
+		new = publish("7.1")
+		seen = []
+
+		def perform(*args, **kwargs):
+			outcome = real_perform(*args, **kwargs)
+			seen.append(present(old))
+			return outcome
+
+		core.perform_container_update = perform
+		core.update_containers([(_ref(core, first), first.name), (_ref(core, second), second.name)])
+		assert seen == [True, True], f"se borró la imagen vieja en mitad del lote: {seen}"
+		assert sent[-1].startswith(core.get_text("updated_batch", 2, 2)), sent[-1]
+
+		deadline = time.time() + 60
+		while time.time() < deadline and any(t.name == "old-images" for t in threading.enumerate()):
+			time.sleep(0.2)
+		assert not present(old), "la imagen vieja sigue ahí"
+		assert fetch("img-a").image.id == new and fetch("img-b").image.id == new
+	finally:
+		core.perform_container_update = real_perform
+		cleanup()
+
+
 def test_docker_run_oddities_survive_their_update():
 	"""
 	`--link` on the default bridge, macvlan with a fixed IP and MAC, two
@@ -1338,8 +1387,9 @@ def test_an_update_says_which_version_it_goes_from_and_to():
 
 		comparison = core.get_image_comparison(ref, container.name)
 		assert (comparison["current_version"], comparison["new_version"]) == ("1.4.2", "2.0.0"), comparison
-		notes = core.comparison_version_notes(comparison)
-		assert core.get_text("update_major_warning") in notes, notes
+		body = core.comparison_body(comparison)
+		assert core.get_text("update_major_short") in body, body
+		assert comparison["new_age_days"] is not None, comparison
 		assert comparison["release_notes_url"].startswith("https://github.com/dgongut/docker-controller-bot/releases")
 
 		assert "1.4.2" in core.available_updates_text([(ref, container.name)])
@@ -1473,7 +1523,7 @@ services:
     container_name: {PREFIX}plex
     labels: [dcbtest=1, DCB-Auto-Update]
     depends_on: [db]
-    ports: ["55201:32400"]
+    ports: ["25201:32400"]
     volumes: ["cfg:/config", "/tmp:/media:ro"]
     tmpfs: ["/transcode"]
     cpus: 2
@@ -1484,28 +1534,34 @@ volumes:
   cfg: {{name: {PREFIX}cfg, labels: [dcbtest=1]}}
 """)
 		vpn = run("vpn")
+		# 8m was too little for runc itself now and then, and the container
+		# never started: "container init was OOM-killed".
 		client.containers.run(BASE, ["sh", "-c", "sleep 1; tail /dev/zero"], name=PREFIX + "qb", detach=True,
-								labels=LABEL, network_mode=f"container:{vpn.id}", mem_limit="8m", memswap_limit="8m",
+								labels=LABEL, network_mode=f"container:{vpn.id}", mem_limit="32m", memswap_limit="32m",
 								privileged=True)
-		time.sleep(4)
+		# Give Docker time to report OOMKilled rather than using a fixed wait;
+		# on a loaded runner that state can arrive after the old four seconds.
+		# The wait is bounded because some daemons lose the OOM event entirely.
+		deadline = time.time() + 30
+		while time.time() < deadline and not (fetch("qb").attrs.get("State") or {}).get("OOMKilled"):
+			time.sleep(0.5)
 		owner = core.manager(core.host_registry.local_host_id())
 		plex, _, can_start, gathered = owner.get_info(fetch("plex").id, PREFIX + "plex")
 		assert not can_start
 		# What it does with a new version is on its button now, not in the text.
 		assert (gathered["update_mode"], gathered["update_mode_label"]) == ("auto", core.LABEL_AUTO_UPDATE), gathered
 		for expected in ("💚", "<code>1.4.2</code>", f"({core.get_text('info_limit')}: 2 CPU)",
-							"/ 256.0 MiB", "55201 → 32400/tcp", f"<code>{PREFIX}cfg</code> → <code>/config</code>",
+							"/ 256.0 MiB", "25201 → 32400/tcp", f"<code>{PREFIX}cfg</code> → <code>/config</code>",
 							"<code>tmpfs</code> → <code>/transcode</code>", "<code>db</code>", "<code>overseerr</code>"):
 			assert expected in plex, (expected, plex)
 		qb, _, can_start, _ = owner.get_info(fetch("qb").id, PREFIX + "qb")
 		assert can_start
-		# The card reads State.OOMKilled, and on a loaded runner Docker can lose
-		# the "oom" that sets it (as test above notes): then the kill shows as
-		# a plain 137 and the card must not claim it ran out of memory.
+		# The card reads State.OOMKilled. If Docker lost the event that sets
+		# it, a plain 137 must not be described as a known out-of-memory kill.
 		oom_known = client.api.inspect_container(PREFIX + "qb")["State"]["OOMKilled"]
 		assert (core.get_text("info_oom") in qb) == oom_known, (oom_known, qb)
 		for expected in ("137 (SIGKILL)", f"<code>{PREFIX}vpn</code>",
-							core.get_text("info_privileged"), "RAM 8.0 MiB"):
+							core.get_text("info_privileged"), "RAM 32.0 MiB"):
 			assert expected in qb, (expected, qb)
 		vpn_info, _, _, _ = owner.get_info(vpn.id, vpn.name)
 		assert f"{core.get_text('info_network_shared_by')}: <code>{PREFIX}qb</code>" in vpn_info, vpn_info
@@ -1645,11 +1701,18 @@ def test_the_monitor_hears_through_its_filter_what_it_reads():
 			BASE, ["sh", "-c", "touch /ok; sleep 4; rm /ok; trap 'exit 0' TERM; sleep 3600 & wait"],
 			name=f"{PREFIX}ev-problems", detach=True, labels=dict(LABEL, **{"DCB-Notifications": "problems"}),
 			healthcheck={"test": ["CMD-SHELL", "test -f /ok"], "interval": 1_000_000_000, "retries": 1})
-		quiet = client.containers.run(BASE, ["sh", "-c", "x=a; while true; do x=$x$x; done"],
-									  name=f"{PREFIX}ev-quiet", detach=True, mem_limit="8m", memswap_limit="8m",
+		# 32m and not 8m, which was too little for runc itself now and then.
+		# Filled by `tail`, which reads /dev/zero as one endless line: a shell
+		# doubling a string got there late on a slow runner, and the test
+		# ended before the oom it was waiting for.
+		quiet = client.containers.run(BASE, ["sh", "-c", "sleep 1; tail /dev/zero"],
+									  name=f"{PREFIX}ev-quiet", detach=True, mem_limit="32m", memswap_limit="32m",
 									  labels=dict(LABEL, **{"DCB-Notifications": "none"}))
+		# Give both events time to arrive rather than relying on a fixed wait.
+		# The timeout still permits daemons that never deliver the OOM event.
 		deadline = time.time() + 30
-		while time.time() < deadline and core.get_text("container_unhealthy", problems.name) not in announced:
+		while time.time() < deadline and (core.get_text("container_unhealthy", problems.name) not in announced
+										  or "oom" not in received):
 			time.sleep(0.5)
 		plain.stop(timeout=5)
 		problems.stop(timeout=5)
@@ -1663,10 +1726,10 @@ def test_the_monitor_hears_through_its_filter_what_it_reads():
 
 	actions = {action.split(":")[0] for action in received}
 	assert actions <= set(core.MONITORED_EVENTS), actions
-	# Docker can lose the "oom" event altogether on a loaded runner (see the
-	# OOM tests above), and the 8 MiB container then only shows up as kill/die.
-	# What this test owns is the filter: "oom" must be one of the events the
-	# monitor asks Docker for, and anything it does receive must pass it.
+	# Docker can lose the "oom" event altogether on a loaded runner. What
+	# this test owns is the filter: it must ask for "oom", and everything
+	# received must pass it. The inspect fallback is covered independently
+	# in tests/test_oom_fallback.py, without requiring a real OOM event.
 	assert "oom" in core.MONITORED_EVENTS, core.MONITORED_EVENTS
 	assert {"create", "start", "kill", "die", "health_status"} <= actions, actions
 	assert not [a for a in received if a.startswith("exec_")], received
