@@ -569,6 +569,88 @@ def test_the_policy_tool_cli_keeps_unknown_keys_and_validates():
         policy_file.path = original
         shutil.rmtree(tmp)
 
+def test_api_reads_multihost_and_translates_http_errors():
+	from homelab import docker_updates as du
+	import urllib.error
+	tmp = _policy_tmpdir()
+	old_env = os.environ.get("HOMELAB_DATA_DIR")
+	os.environ["HOMELAB_DATA_DIR"] = str(tmp)
+	try:
+		api = du.API()
+		assert api.envs == {3: "🏠 Docker-VM", 5: "☁️ Osaka Lab"}
+		assert api.urls[3] == "unix:///var/run/docker.sock"
+		assert api.urls[5] == "ssh://osaka-lab"
+
+		class Resp:
+			def __init__(self, code, body, reason="ERR"):
+				self.status_code, self.content, self.reason, self.headers = code, body, reason, {}
+
+		class FakeClient:
+			base_url, _version = "http+docker://localhost", "1.47"
+			closed = False
+
+			def request(self, method, url, data=None, headers=None, timeout=90):
+				if url.endswith("/ok"):
+					return Resp(200, b'{"ok":true}', "OK")
+				return Resp(404, b'{"message":"no such container"}', "Not Found")
+
+			def close(self):
+				self.closed = True
+
+		fake = FakeClient()
+		api._clients[3] = fake
+		assert api.call(3, "/ok") == {"ok": True}
+		try:
+			api.call(3, "/missing")
+		except urllib.error.HTTPError as ex:
+			assert ex.code == 404
+		else:
+			raise AssertionError("404 must raise urllib.error.HTTPError")
+		api.close()
+		assert fake.closed
+	finally:
+		if old_env is None:
+			os.environ.pop("HOMELAB_DATA_DIR", None)
+		else:
+			os.environ["HOMELAB_DATA_DIR"] = old_env
+		shutil.rmtree(tmp)
+
+
+def test_self_update_rewrites_compose_and_spawns_helper():
+	from homelab import self_update
+	import docker
+	tmp = _policy_tmpdir()
+	compose = tmp / "compose.yaml"
+	compose.write_text("services:\n  docker-controller-bot:\n    image: homelab/docker-controller-bot:v5.5.0-h33\n")
+	compose.chmod(0o600)
+	cfg = {"compose_file": str(compose), "host_stack_dir": "/opt/panels/docker-controller-bot"}
+	assert self_update.current_image(cfg) == "homelab/docker-controller-bot:v5.5.0-h33"
+	runs = []
+
+	class Containers:
+		def run(self, image, **kwargs):
+			runs.append((image, kwargs))
+
+	class FakeDocker:
+		containers = Containers()
+
+		def close(self):
+			pass
+
+	original = docker.from_env
+	docker.from_env = lambda *a, **k: FakeDocker()
+	try:
+		self_update.set_stack_image(cfg, "homelab/docker-controller-bot:v5.5.0-h34")
+		assert self_update.current_image(cfg) == "homelab/docker-controller-bot:v5.5.0-h34"
+		assert (compose.stat().st_mode & 0o777) == 0o600
+		assert len(runs) == 1
+		assert runs[0][0] == "homelab/docker-controller-bot:v5.5.0-h34"
+		assert runs[0][1]["detach"] is True and runs[0][1]["auto_remove"] is True
+	finally:
+		docker.from_env = original
+		shutil.rmtree(tmp)
+
+
 if __name__ == "__main__":
 	failed = 0
 	for name, fn in sorted(globals().items()):

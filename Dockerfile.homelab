@@ -13,7 +13,7 @@ LABEL org.opencontainers.image.title="docker-controller-bot" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.source="https://github.com/ByteJuno/docker-controller-bot" \
       org.opencontainers.image.licenses="GPL-3.0" \
-      org.opencontainers.image.description="docker-controller-bot with homelab plugins (/status, /quota, Portainer update flow)" \
+      org.opencontainers.image.description="docker-controller-bot with homelab plugins (/status, multi-host Docker update flow, self-update)" \
       org.opencontainers.image.base.name="${BASE_IMAGE}"
 
 # TELEMETRY=0 is read by the telemetry client itself and wins over /settings.

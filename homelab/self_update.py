@@ -3,30 +3,30 @@
 CI tags every tested homelab commit as homelab-v<upstream>-h<n>. Every six
 hours this looks at the fork's tags; a newer one is built here, on the Docker
 host the bot runs on, and announced with Deploy / Ignore buttons. Deploy
-records what is being replaced and asks Portainer to switch the bot's stack to
-the new image, which restarts the bot. The new bot reports the outcome when it
-starts. If it does not come up, dcb_guard.py on Osaka Lab puts the old image
-back and the old bot reports that instead.
+records what is being replaced, updates the bot's compose.yaml in /app/stack,
+and spawns a detached docker-compose helper container to recreate the bot. The
+new bot reports the outcome when it starts. If it does not come up,
+dcb_guard.py on Osaka Lab puts the old image back and the old bot reports that
+instead.
 
 Open issues labelled upstream-sync (an upstream release that does not merge or
 does not pass the tests) are reported once each.
 
 Configuration, in the volume as self-update.json:
-	{"stack_id": 7, "endpoint_id": 3,
+	{"compose_file": "/app/stack/compose.yaml",
+	 "host_stack_dir": "/opt/panels/docker-controller-bot",
 	 "build_args": {"APK_MIRROR": "...", "PIP_INDEX_URL": "..."}}
-Without it the plugin stays idle. Portainer's address and key come from
-portainer-multihost.json, which the update flow already uses.
+Without it the plugin stays idle.
 """
 import io
 import json
 import logging
 import os
+import pathlib
 import re
-import ssl
 import tarfile
 import threading
 import time
-import urllib.request
 
 import requests
 
@@ -78,33 +78,58 @@ def telegram(text, buttons=None):
 	return send(text, buttons)
 
 
-# ---------- Portainer ----------
+# ---------- Compose stack deployment ----------
 
-def portainer(path, method="GET", data=None):
-	cfg = json.loads(paths.data_file("portainer-multihost.json").read_text())
-	ctx = ssl.create_default_context(cafile=paths.certificate(cfg["certificate"]))
-	ctx.check_hostname = False
-	req = urllib.request.Request(cfg["url"].rstrip("/") + path, method=method,
-								data=json.dumps(data).encode() if data is not None else None,
-								headers={"X-API-Key": cfg["api_key"], "Content-Type": "application/json"})
-	with urllib.request.urlopen(req, context=ctx, timeout=300) as f:
-		body = f.read()
-	return json.loads(body) if body else None
+DEFAULT_COMPOSE_FILE = "/app/stack/compose.yaml"
+DEFAULT_HOST_STACK_DIR = "/opt/panels/docker-controller-bot"
+DEFAULT_COMPOSE_BIN = "/usr/libexec/docker/cli-plugins/docker-compose"
 
 
-def set_stack_image(cfg, image):
-	stack = portainer(f"/api/stacks/{cfg['stack_id']}")
-	content = portainer(f"/api/stacks/{cfg['stack_id']}/file")["StackFileContent"]
+def _compose_path(cfg):
+	return pathlib.Path((cfg or {}).get("compose_file") or DEFAULT_COMPOSE_FILE)
+
+
+def _replace_image_line(content, image):
 	lines = [ln for ln in content.splitlines() if ln.strip().startswith(f"image: {IMAGE}:")]
 	if len(lines) != 1:
 		raise RuntimeError(f"stack has {len(lines)} lines with image: {IMAGE}")
-	content = content.replace(lines[0].strip(), f"image: {image}")
-	portainer(f"/api/stacks/{cfg['stack_id']}?endpointId={cfg['endpoint_id']}", "PUT",
-			{"stackFileContent": content, "env": stack.get("Env") or [], "prune": False, "pullImage": False})
+	return content.replace(lines[0].strip(), f"image: {image}", 1)
+
+
+def set_stack_image(cfg, image):
+	import docker
+	path = _compose_path(cfg)
+	content = _replace_image_line(path.read_text(encoding="utf-8"), image)
+	mode = path.stat().st_mode & 0o777 if path.exists() else 0o600
+	tmp = path.with_suffix(".yaml.tmp")
+	tmp.write_text(content, encoding="utf-8")
+	tmp.chmod(mode)
+	tmp.replace(path)
+	host_dir = (cfg or {}).get("host_stack_dir") or DEFAULT_HOST_STACK_DIR
+	compose_bin = (cfg or {}).get("compose_bin") or DEFAULT_COMPOSE_BIN
+	helper_image = (cfg or {}).get("helper_image") or image
+	client = docker.from_env(timeout=120)
+	try:
+		client.containers.run(
+			helper_image,
+			entrypoint=["/usr/local/bin/docker-compose"],
+			command=["-f", f"{host_dir}/compose.yaml", "up", "-d", "--pull", "never"],
+			detach=True,
+			auto_remove=True,
+			name=f"dcb-self-deploy-{int(time.time())}",
+			working_dir=host_dir,
+			volumes={
+				"/var/run/docker.sock": {"bind": "/var/run/docker.sock", "mode": "rw"},
+				compose_bin: {"bind": "/usr/local/bin/docker-compose", "mode": "ro"},
+				host_dir: {"bind": host_dir, "mode": "rw"},
+			},
+		)
+	finally:
+		client.close()
 
 
 def current_image(cfg):
-	content = portainer(f"/api/stacks/{cfg['stack_id']}/file")["StackFileContent"]
+	content = _compose_path(cfg).read_text(encoding="utf-8")
 	return next(ln.strip()[len("image: "):] for ln in content.splitlines() if ln.strip().startswith(f"image: {IMAGE}:"))
 
 
@@ -270,7 +295,7 @@ def install(bot, menu):
 		bot.edit_message_text(f"🚀 正在部署机器人 {version_of(tag)}，机器人会重启，稍后报告结果。",
 							call.message.chat.id, call.message.message_id)
 		try:
-			set_stack_image(cfg, image)   # Portainer recreates this container: nothing after this is guaranteed to run.
+			set_stack_image(cfg, image)   # Detached compose helper recreates this container: nothing after this is guaranteed to run.
 		except Exception as ex:
 			with lock:
 				state = load_state()

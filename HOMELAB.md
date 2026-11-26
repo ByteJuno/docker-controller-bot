@@ -6,7 +6,7 @@
 | :--- | :--- |
 | `homelab/main.py` | 镜像入口：把上游的 `docker-controller-bot.py` 当模块加载（命令和回调就注册好了），再装插件、启动 |
 | `homelab/plugins.py` | 把插件装到上游的 bot 上，并挪到上游兜底处理函数的前面；命令菜单里加 `/status` |
-| `homelab/docker_updates.py` | 经 Portainer 查新、默认自动更新（opt-out），保留回退容器 2 天，清理构建缓存（每天 03:30 由外部触发 `--scan`） |
+| `homelab/docker_updates.py` | 经本地 `docker.sock` 与 `ssh://osaka-lab` 查新、默认自动更新（opt-out），保留回退容器 2 天，清理构建缓存（每天 03:30 由外部触发 `--scan`） |
 | `homelab/policy.py` | 读取/校验/原子保存 `docker-update-policy.json`，并提供 `python3 -m homelab.policy` 维护入口 |
 | `homelab/n8n_status.py` | `/status`：转发给 n8n 的主机状态报告 |
 | `homelab/self_update.py` | 机器人自己的更新（见下） |
@@ -28,7 +28,7 @@
   postgres/mysql/mariadb/mongo/redis/valkey/clickhouse/influxdb/couchdb 的容器，照常查新并发按钮，
   但不会自动更新；确需自动的在 compose 上加 `DCB-Auto-Update: "true"` 单独放开。
 - `daidai-panel` 交给 Watchtower（每小时），插件不自动更新它，避免两套更新器互相覆盖。
-- `docker-controller-bot`、`portainer`、`portainer_edge_agent`、`n8n-postgres`、本地构建镜像
+- `docker-controller-bot`、`dockge`、`n8n-postgres`、本地构建镜像
   （`local/*`、`homelab/*`、`:local`）、回退容器、停止的容器、共享命名空间、固定摘要：一律不自动。
 - 新增的容器同样按上面的默认处理，不需要逐个打标签。
 
@@ -63,9 +63,9 @@ docker exec docker-controller-bot python3 -m homelab.policy --remove-database-na
 
 1. **CI**（`.github/workflows/homelab.yml`）：每次推送 `homelab` 跑上游的全部测试和插件测试、试构建镜像，通过后打 `homelab-v<上游版本>-h<提交数>` 标签；测试不过就开（或更新）一个 `upstream-sync` issue，不推送。上游出了新的正式版本，由 lab 上的 `upstream_merge.py` 交给 gpt-6.1-sol 审核并合并到 `upstream-sync/<版本>` 分支（有冲突也由它解决），再向 `homelab` 开 PR；PR 跑全部测试但不打标签，测试通过后脚本自动合并，结果私聊机主。手动运行这个 workflow 仍会直接合并上游最新正式版。
 2. **机器人**（`self_update.py`）：每 6 小时看一次这些标签，有更新的就在自己所在的 Docker 主机上构建，构建好后在 Telegram 发「部署 / 忽略此版本」按钮。`upstream-sync` issue 也会提醒一次。
-3. **部署**：点「部署」后经 Portainer 把 bot 的 Stack 换成新镜像；新 bot 启动后报告「已更新」。没起来的话，外部的看门狗 5 分钟后换回旧镜像，旧 bot 报告「已回滚」。
+3. **部署**：点「部署」后把挂载的 `compose.yaml` 换成新镜像并起一次性 `docker-compose` 容器重建自身；新 bot 启动后报告「已更新」。没起来的话，外部的看门狗 5 分钟后换回旧镜像，旧 bot 报告「已回滚」。
 
-插件配置都在数据卷里，不在仓库中：`portainer-multihost.json`（Portainer 地址和密钥）、`portainer-cert.pem`、`n8n-status.json`、`self-update.json`（Stack 编号和构建镜像源）。
+插件配置都在数据卷里，不在仓库中：`docker-multihost.json`（可选环境映射，默认直连本机 `docker.sock` + `ssh://osaka-lab`）、`n8n-status.json`、`self-update.json`（compose 路径和构建镜像源）。
 
 ```bash
 python3 tests/run_all.py && python3 tests/test_homelab.py

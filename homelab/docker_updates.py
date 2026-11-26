@@ -1,6 +1,6 @@
-"""Daily registry checks and explicitly approved Docker updates through Portainer."""
-import copy, contextlib, fcntl, hashlib, json, os, pathlib, re, secrets, sqlite3
-import ssl, sys, threading, time, urllib.parse, urllib.request
+"""Daily registry checks and explicitly approved Docker updates over local socket and SSH."""
+import copy, contextlib, fcntl, hashlib, io, json, os, pathlib, re, secrets, sqlite3
+import sys, threading, time, urllib.error, urllib.parse
 import requests
 if __package__ in (None, ""):
     # Run as a script (python3 /app/homelab/docker_updates.py --scan): make the package importable.
@@ -11,8 +11,12 @@ from datetime import datetime, timezone
 
 ROOT=pathlib.Path(os.environ.get('UPDATE_STATE_DIR') or homelab_paths.data_file('image-updates'))
 ROOT.mkdir(mode=0o700,parents=True,exist_ok=True)
-PROTECTED={'docker-controller-bot':'定制机器人需合并代码更新','portainer':'管理入口需单独维护',
-           'portainer_edge_agent':'Agent 与 Portainer 版本需配套','n8n-postgres':'数据库需单独维护'}
+PROTECTED={'docker-controller-bot':'定制机器人需合并代码更新','dockge':'管理入口需单独维护',
+           'n8n-postgres':'数据库需单独维护'}
+DEFAULT_ENVIRONMENTS={
+    3:{'name':'🏠 Docker-VM','url':'unix:///var/run/docker.sock'},
+    5:{'name':'☁️ Osaka Lab','url':'ssh://osaka-lab'},
+}
 # 带上游同名标签 DCB-Auto-Update 的容器：发现新镜像后不等按钮，在每日检查末尾直接更新（2026-10-03）。
 # 沿用上游的标签名而不是自起一个，换到上游 5.0 时 compose 不用改。上游自带的查新（CHECK_UPDATES）仍关闭：
 # 它每次都要拉镜像、4.2.0 只管本机，也没有健康检查和回退。这里的流程与手动确认完全相同
@@ -42,15 +46,35 @@ def db():
 
 class API:
     def __init__(self):
-        self.cfg=json.loads(homelab_paths.data_file('portainer-multihost.json').read_text())
-        self.envs={int(k):v for k,v in self.cfg['environments'].items()}
-        self.ctx=ssl.create_default_context(cafile=homelab_paths.certificate(self.cfg['certificate']));self.ctx.check_hostname=False
+        cfg_path=homelab_paths.data_file('docker-multihost.json')
+        raw=json.loads(cfg_path.read_text())['environments'] if cfg_path.is_file() else DEFAULT_ENVIRONMENTS
+        self.envs={};self.urls={};self._clients={}
+        for k,v in raw.items():
+            eid=int(k)
+            if isinstance(v,dict):
+                self.envs[eid]=v['name'];self.urls[eid]=v['url']
+            else:
+                self.envs[eid]=str(v);self.urls[eid]=DEFAULT_ENVIRONMENTS[eid]['url']
+    def _client(self,eid):
+        if eid not in self._clients:
+            import docker
+            url=self.urls[eid]
+            kw={'use_ssh_client':True} if url.startswith('ssh://') else {}
+            self._clients[eid]=docker.APIClient(base_url=url,version='auto',timeout=90,**kw)
+        return self._clients[eid]
+    def close(self):
+        while self._clients:
+            _,c=self._clients.popitem()
+            with contextlib.suppress(Exception):c.close()
     def call(self,eid,path,method='GET',data=None,raw=False,timeout=90):
         if eid not in self.envs:raise ValueError('Unknown environment')
-        request=urllib.request.Request(self.cfg['url'].rstrip('/')+f'/api/endpoints/{eid}/docker'+path,
-            data=json.dumps(data).encode() if data is not None else None,method=method,
-            headers={'X-API-Key':self.cfg['api_key'],'Content-Type':'application/json'})
-        with urllib.request.urlopen(request,context=self.ctx,timeout=timeout) as f:b=f.read()
+        c=self._client(eid)
+        body=json.dumps(data).encode() if data is not None else None
+        headers={'Content-Type':'application/json'} if data is not None else None
+        r=c.request(method,f"{c.base_url}/v{c._version}{path}",data=body,headers=headers,timeout=timeout)
+        if r.status_code>=400:
+            raise urllib.error.HTTPError(path,r.status_code,r.reason,dict(r.headers),io.BytesIO(r.content))
+        b=r.content
         return b if raw else json.loads(b) if b else None
 
 def refparts(ref):
@@ -210,61 +234,64 @@ def exclusion(c):
 
 def scan(notify=True):
     api=API();result={'checked':0,'updates':0,'notified':0,'errors':[],'skipped':[]}
-    with open(ROOT/'scan.lock','w') as lock:
-        try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
-        except BlockingIOError:return {'busy':True}
-        cache={};autos=[];settings=policy();would_auto=0
-        result['policy']={'source':settings.get('source','unknown')}
-        if settings.get('problem'):result['policy']['problem']=settings['problem']
-        if notify:notify_policy_problem(settings)
-        for eid,label in api.envs.items():
-            try:containers=api.call(eid,'/containers/json?all=1')
-            except Exception as ex:result['errors'].append(label+'：环境不可达');continue
-            for summary in containers:
-                name=(summary.get('Names')or['?'])[0].lstrip('/')
-                try:
-                    c=api.call(eid,'/containers/'+summary['Id']+'/json')
-                    if (c['Config'].get('Labels') or {}).get('homelab.test')=='update-fixture':continue
-                    reason=exclusion(c)
-                    if reason:result['skipped'].append(label+'/'+name+'：'+reason);continue
-                    local=api.call(eid,'/images/'+c['Image']+'/json');ref=(c['Config'].get('Labels') or {}).get('homelab.update.image') or c['Config']['Image']
-                    key=(eid,ref,local['Architecture'],local.get('Variant',''))
-                    if key not in cache:cache[key]=resolve_image(api,eid,ref,local)
-                    target=cache[key];result['checked']+=1
-                    if matches(local,target):
-                        with db() as conn:conn.execute("UPDATE candidates SET status='superseded' WHERE eid=? AND cid=? AND status='pending'",(eid,c['Id']))
-                        continue
-                    result['updates']+=1
-                    pending={'eid':eid,'cid':c['Id'],'name':name,'old_image':c['Image'],'target':target,'environment':label,'created':time.time()}
-                    with db() as conn:
-                        row=conn.execute("SELECT * FROM candidates WHERE eid=? AND cid=? AND target=? AND (status='ignored' OR (status='pending' AND expires>?))",(eid,c['Id'],target['config'],time.time())).fetchone()
-                        if row and row['status']=='ignored':continue
-                        if row:ident=row['id'];sent=row['notified']
-                        else:
-                            ident=secrets.token_hex(10);sent=0
-                            conn.execute('INSERT INTO candidates VALUES (?,?,?,?,?,?,?,?)',(ident,eid,c['Id'],target['config'],json.dumps(pending),'pending',time.time()+72*3600,0))
-                        failed=conn.execute("SELECT 1 FROM candidates WHERE eid=? AND cid=? AND target=? AND status='failed'",(eid,c['Id'],target['config'])).fetchone()
-                        data=json.loads(conn.execute('SELECT data FROM candidates WHERE id=?',(ident,)).fetchone()[0])
-                    if not failed and auto_reason(c,settings) is None:
-                        would_auto+=1
-                        if notify:autos.append((ident,data))
-                        continue
-                    if notify and not sent:
-                        telegram(f"🐳 Docker 镜像发现更新\n{label} / {name}\n镜像：{ref}\n平台：{target['platform']}\n当前：{c['Image'][7:19]}\n新版本：{target['config'][7:19]}\n\n点下方查看确认，才会更新。候选有效期 72 小时。",
-                                 [[{'text':'查看并确认更新','callback_data':'du:a:'+ident},{'text':'忽略此候选','callback_data':'du:x:'+ident}]])
-                        with db() as conn:conn.execute('UPDATE candidates SET notified=1 WHERE id=?',(ident,))
-                        result['notified']+=1
-                except Exception as ex:result['errors'].append(label+'/'+name+'：检查失败（'+type(ex).__name__+'）')
-        if notify and result['errors']:
-            tell('⚠️ Docker 更新检查有未完成项目\n'+'\n'.join(result['errors'])+'\n其余项目已照常检查，出错的项目未做任何更新。')
-        for ident,p in autos:
-            with db() as conn:conn.execute("UPDATE candidates SET status='approved' WHERE id=? AND status='pending'",(ident,))
-            worker(ident,p,None,auto=True)
-        result['auto']=len(autos);result['would_auto']=would_auto
-        result['cleanup']=scan_cleanup(api,notify)
-        result['images']=prune_images(api,notify)
-        result['build_cache']=prune_build_cache(api,notify)
-        return result
+    try:
+        with open(ROOT/'scan.lock','w') as lock:
+            try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            except BlockingIOError:return {'busy':True}
+            cache={};autos=[];settings=policy();would_auto=0
+            result['policy']={'source':settings.get('source','unknown')}
+            if settings.get('problem'):result['policy']['problem']=settings['problem']
+            if notify:notify_policy_problem(settings)
+            for eid,label in api.envs.items():
+                try:containers=api.call(eid,'/containers/json?all=1')
+                except Exception as ex:result['errors'].append(label+'：环境不可达');continue
+                for summary in containers:
+                    name=(summary.get('Names')or['?'])[0].lstrip('/')
+                    try:
+                        c=api.call(eid,'/containers/'+summary['Id']+'/json')
+                        if (c['Config'].get('Labels') or {}).get('homelab.test')=='update-fixture':continue
+                        reason=exclusion(c)
+                        if reason:result['skipped'].append(label+'/'+name+'：'+reason);continue
+                        local=api.call(eid,'/images/'+c['Image']+'/json');ref=(c['Config'].get('Labels') or {}).get('homelab.update.image') or c['Config']['Image']
+                        key=(eid,ref,local['Architecture'],local.get('Variant',''))
+                        if key not in cache:cache[key]=resolve_image(api,eid,ref,local)
+                        target=cache[key];result['checked']+=1
+                        if matches(local,target):
+                            with db() as conn:conn.execute("UPDATE candidates SET status='superseded' WHERE eid=? AND cid=? AND status='pending'",(eid,c['Id']))
+                            continue
+                        result['updates']+=1
+                        pending={'eid':eid,'cid':c['Id'],'name':name,'old_image':c['Image'],'target':target,'environment':label,'created':time.time()}
+                        with db() as conn:
+                            row=conn.execute("SELECT * FROM candidates WHERE eid=? AND cid=? AND target=? AND (status='ignored' OR (status='pending' AND expires>?))",(eid,c['Id'],target['config'],time.time())).fetchone()
+                            if row and row['status']=='ignored':continue
+                            if row:ident=row['id'];sent=row['notified']
+                            else:
+                                ident=secrets.token_hex(10);sent=0
+                                conn.execute('INSERT INTO candidates VALUES (?,?,?,?,?,?,?,?)',(ident,eid,c['Id'],target['config'],json.dumps(pending),'pending',time.time()+72*3600,0))
+                            failed=conn.execute("SELECT 1 FROM candidates WHERE eid=? AND cid=? AND target=? AND status='failed'",(eid,c['Id'],target['config'])).fetchone()
+                            data=json.loads(conn.execute('SELECT data FROM candidates WHERE id=?',(ident,)).fetchone()[0])
+                        if not failed and auto_reason(c,settings) is None:
+                            would_auto+=1
+                            if notify:autos.append((ident,data))
+                            continue
+                        if notify and not sent:
+                            telegram(f"🐳 Docker 镜像发现更新\n{label} / {name}\n镜像：{ref}\n平台：{target['platform']}\n当前：{c['Image'][7:19]}\n新版本：{target['config'][7:19]}\n\n点下方查看确认，才会更新。候选有效期 72 小时。",
+                                     [[{'text':'查看并确认更新','callback_data':'du:a:'+ident},{'text':'忽略此候选','callback_data':'du:x:'+ident}]])
+                            with db() as conn:conn.execute('UPDATE candidates SET notified=1 WHERE id=?',(ident,))
+                            result['notified']+=1
+                    except Exception as ex:result['errors'].append(label+'/'+name+'：检查失败（'+type(ex).__name__+'）')
+            if notify and result['errors']:
+                tell('⚠️ Docker 更新检查有未完成项目\n'+'\n'.join(result['errors'])+'\n其余项目已照常检查，出错的项目未做任何更新。')
+            for ident,p in autos:
+                with db() as conn:conn.execute("UPDATE candidates SET status='approved' WHERE id=? AND status='pending'",(ident,))
+                worker(ident,p,None,auto=True)
+            result['auto']=len(autos);result['would_auto']=would_auto
+            result['cleanup']=scan_cleanup(api,notify)
+            result['images']=prune_images(api,notify)
+            result['build_cache']=prune_build_cache(api,notify)
+            return result
+    finally:
+        if hasattr(api,'close'):api.close()
 
 
 def timestamp(value):
@@ -411,6 +438,7 @@ def prune_build_cache(api,notify=True):
     return result
 
 def cleanup_worker(ident,p,chat):
+    api=None
     try:
         with open(ROOT/'apply.lock','w') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
@@ -422,7 +450,9 @@ def cleanup_worker(ident,p,chat):
         tell('✅ 已清理旧容器：'+p['environment']+' / '+p['name']+'\n新容器、镜像和数据卷均保留。',chat=chat)
     except Exception as ex:
         with db() as conn:conn.execute("UPDATE candidates SET status='failed' WHERE id=?",(ident,))
-        tell('⚠️ 旧容器清理未完成：'+p['name']+'\n'+(str(ex) if isinstance(ex,ValueError) else type(ex).__name__)+'\n请检查 Portainer，未自动重试。',chat=chat)
+        tell('⚠️ 旧容器清理未完成：'+p['name']+'\n'+(str(ex) if isinstance(ex,ValueError) else type(ex).__name__)+'\n请检查 Dockge，未自动重试。',chat=chat)
+    finally:
+        if hasattr(api,'close'):api.close()
 
 def candidate(ident):
     with db() as conn:row=conn.execute('SELECT * FROM candidates WHERE id=?',(ident,)).fetchone()
@@ -492,7 +522,7 @@ def apply_update(api,p,ident):
         if other['Id']==cid:continue
         h=api.call(eid,'/containers/'+other['Id']+'/json')['HostConfig']
         if any(str(h.get(k,'')) in ('container:'+cid,'container:'+name) for k in ('NetworkMode','PidMode','IpcMode')):
-            raise ValueError('其他容器依赖此容器命名空间，请在 Portainer 协调更新')
+            raise ValueError('其他容器依赖此容器命名空间，请在 Dockge 协调更新')
     local=api.call(eid,'/images/'+old['Image']+'/json')
     current=resolve_image(api,eid,p['target']['ref'],local)
     if current['config']!=p['target']['config']:raise TagMoved(current,matches(local,current))
@@ -552,12 +582,13 @@ def reoffer(ident,p,ex,chat):
     with db() as conn:conn.execute('UPDATE candidates SET notified=1 WHERE id=?',(new,))
 
 def worker(ident,p,chat,auto=False):
+    api=None
     try:
         with open(ROOT/'apply.lock','w') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             with db() as conn:conn.execute("UPDATE candidates SET status='running' WHERE id=?",(ident,))
             if not auto:tell('⏳ 正在更新 '+p['environment']+' / '+p['name']+'\n将验证镜像和启动状态。',chat=chat)
-            result=apply_update(API(),p,ident)
+            api=API();result=apply_update(api,p,ident)
             # 'applied' 是回退容器诞生的时刻，保留期以它为准：容器被重启过会刷新 FinishedAt，
             # 用 FinishedAt 计时会让保留期无限延后（2026-09-21 遇到过两个放了 16 天没删的）。
             with db() as conn:conn.execute("UPDATE candidates SET status='done',data=? WHERE id=?",(json.dumps({**p,'new_id':result['new_id'],'applied':time.time()}),ident))
@@ -575,8 +606,10 @@ def worker(ident,p,chat,auto=False):
     except Exception as ex:
         with db() as conn:conn.execute("UPDATE candidates SET status='failed' WHERE id=?",(ident,))
         safe=str(ex) if isinstance(ex,ValueError) else type(ex).__name__
-        tell(('⚠️ 自动更新未完成：' if auto else '⚠️ 更新未完成：')+p['environment']+' / '+p['name']+'\n'+safe+'\n请在 Portainer 检查当前状态；不会自动重试更新。'
+        tell(('⚠️ 自动更新未完成：' if auto else '⚠️ 更新未完成：')+p['environment']+' / '+p['name']+'\n'+safe+'\n请在 Dockge 检查当前状态；不会自动重试更新。'
                  +('\n这个版本下次检查改为发确认按钮。' if auto else ''),chat=chat)
+    finally:
+        if hasattr(api,'close'):api.close()
 
 def install(bot,menu):
     @bot.callback_query_handler(func=lambda c: bool(c.data and c.data.startswith('du:')))
