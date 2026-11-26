@@ -9,8 +9,22 @@ upstream file is edited.
 import telebot
 
 import core
+import host_registry
 from logger import error
 from homelab import docker_updates, n8n_status, self_update
+
+# Cross-border Tailscale SSH (home -> osaka-lab) can hit 300ms+ RTT and packet
+# loss during evening peak, making a cold SSH handshake exceed the upstream 5s
+# probe deadline and triggering drop() in a loop. Raise probe deadline to 15s
+# without touching upstream src/host_registry.py.
+CROSS_BORDER_PROBE_SECONDS = 15
+
+
+def tune_host_probes():
+	host_registry.PROBE_TIMEOUT_SECONDS = CROSS_BORDER_PROBE_SECONDS
+	host_registry.reachable_hosts.__defaults__ = (CROSS_BORDER_PROBE_SECONDS,)
+	host_registry.host_status.__defaults__ = (CROSS_BORDER_PROBE_SECONDS,)
+	host_registry.status_snapshot.__defaults__ = (CROSS_BORDER_PROBE_SECONDS, None)
 
 COMMANDS = [
 	telebot.types.BotCommand("/status", "查询 Home Lab 三台主机实时状态"),
@@ -42,6 +56,7 @@ def _to_front(handlers, count):
 
 
 def install(bot):
+	tune_host_probes()
 	before = len(bot.message_handlers), len(bot.callback_query_handlers)
 	menu = Menu(bot)
 	for plugin in (docker_updates, n8n_status, self_update):

@@ -7,10 +7,8 @@
 ARG BASE_IMAGE=alpine:3.24.2
 FROM ${BASE_IMAGE}
 ARG BASE_IMAGE
-ARG VERSION=dev
 
 LABEL org.opencontainers.image.title="docker-controller-bot" \
-      org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.source="https://github.com/ByteJuno/docker-controller-bot" \
       org.opencontainers.image.licenses="GPL-3.0" \
       org.opencontainers.image.description="docker-controller-bot with homelab plugins (/status, multi-host Docker update flow, self-update)" \
@@ -19,8 +17,7 @@ LABEL org.opencontainers.image.title="docker-controller-bot" \
 # TELEMETRY=0 is read by the telemetry client itself and wins over /settings.
 ENV TZ=UTC \
     PYTHONUNBUFFERED=1 \
-    TELEMETRY=0 \
-    HOMELAB_VERSION=${VERSION}
+    TELEMETRY=0
 
 WORKDIR /app
 
@@ -36,6 +33,10 @@ RUN if [ -n "$APK_MIRROR" ]; then sed -i "s#dl-cdn.alpinelinux.org#$APK_MIRROR#g
 RUN mkdir -p /etc/ssh/ssh_config.d && \
     printf 'Host *\n    BatchMode yes\n    ConnectTimeout 10\n    ServerAliveInterval 10\n    ServerAliveCountMax 3\n' \
         > /etc/ssh/ssh_config.d/docker-controller-bot.conf
+
+ARG VERSION=dev
+ENV HOMELAB_VERSION=${VERSION}
+LABEL org.opencontainers.image.version="${VERSION}"
 
 COPY src/ /app/
 RUN chmod +x /app/dcb_mute.py && \

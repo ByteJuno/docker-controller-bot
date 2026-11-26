@@ -651,6 +651,13 @@ def test_self_update_rewrites_compose_and_spawns_helper():
 		shutil.rmtree(tmp)
 
 
+def test_host_probe_timeout_is_raised_for_cross_border_ssh():
+	import host_registry
+	assert host_registry.PROBE_TIMEOUT_SECONDS == 15
+	assert host_registry.status_snapshot.__defaults__ == (15, None)
+	assert host_registry.reachable_hosts.__defaults__ == (15,)
+
+
 if __name__ == "__main__":
 	failed = 0
 	for name, fn in sorted(globals().items()):
