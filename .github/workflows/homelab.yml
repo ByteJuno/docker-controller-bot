@@ -198,6 +198,13 @@ jobs:
         run: pip install --quiet paramiko -r requirements.txt
       - name: Record Docker environment
         run: |
+          # Upstream v5.5.0 test_real_docker.py hardcodes -o parent=eth0 for macvlan
+          # (fixed post-v5.5.0 in upstream 8924f6e); GitHub runners sometimes name
+          # the primary NIC enp39s0/ens5 instead of eth0.
+          if ! ip link show eth0 >/dev/null 2>&1; then
+            sudo ip link add eth0 type dummy
+            sudo ip link set eth0 up
+          fi
           docker version
           docker compose version
           docker info --format 'storage={{.Driver}} cgroup={{.CgroupDriver}} v{{.CgroupVersion}}'
