@@ -552,7 +552,15 @@ def apply_update(api,p,ident):
         spec=payload(old,pulled['Id']);spec.setdefault('Labels',{});spec['Labels']=spec['Labels'] or {};spec['Labels']['homelab.update.image']=p['target']['ref']
         created=api.call(eid,'/containers/create?name='+urllib.parse.quote(name),'POST',spec);newid=created['Id']
         api.call(eid,'/containers/'+newid+'/start','POST');wait_healthy(api,eid,newid)
-        return {'new_id':newid,'rollback_container':rollback,'image':pulled['Id']}
+        # 新容器已健康启动后直接清理停止态旧容器（v=0 保留全部卷），避免其不可变的 com.docker.compose.project 标签
+        # 导致 Dockge 将整个栈误报为红色「已退出」并混入旧日志；旧容器配置快照与旧镜像（14天）仍保留可供回退。
+        rollback_removed=False
+        try:
+            api.call(eid,'/containers/'+cid+'?force=0&v=0','DELETE')
+            rollback_removed=True
+        except Exception:
+            pass
+        return {'new_id':newid,'rollback_container':rollback,'rollback_removed':rollback_removed,'image':pulled['Id']}
     except Exception:
         if newid:api.call(eid,'/containers/'+newid+'?force=1','DELETE')
         if renamed:api.call(eid,'/containers/'+cid+'/rename?name='+urllib.parse.quote(name),'POST')
@@ -593,7 +601,8 @@ def worker(ident,p,chat,auto=False):
             # 用 FinishedAt 计时会让保留期无限延后（2026-09-21 遇到过两个放了 16 天没删的）。
             with db() as conn:conn.execute("UPDATE candidates SET status='done',data=? WHERE id=?",(json.dumps({**p,'new_id':result['new_id'],'applied':time.time()}),ident))
         # 已经记为 done：这条通知发不出去也不能再进下面的 except（见 tell）
-        tell(('🤖 已自动更新：' if auto else '✅ 更新完成：')+p['environment']+' / '+p['name']+'\n镜像：'+result['image'][7:19]+'\n旧容器已停止并保留供回退，满2天后由每日检查自动删除。',chat=chat)
+        tail='\n旧容器已清理（旧镜像保留14天可供回退）。' if result.get('rollback_removed') else '\n旧容器已停止并保留供回退，满2天后由每日检查自动删除。'
+        tell(('🤖 已自动更新：' if auto else '✅ 更新完成：')+p['environment']+' / '+p['name']+'\n镜像：'+result['image'][7:19]+tail,chat=chat)
     except TagMoved as ex:
         if auto:
             # 检查和执行之间标签又变了：本轮不动，下次检查按新版本自动更新。
