@@ -21,7 +21,7 @@ set -eu
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BASE=$(sed -n 's/^ARG BASE_IMAGE=//p' "$ROOT/Dockerfile")
-RUNNER=dcb-tests-dind
+RUNNER=
 INSTALL='PIP_BREAK_SYSTEM_PACKAGES=1 PIP_ROOT_USER_ACTION=ignore pip3 install --no-cache-dir -q -r requirements.txt'
 
 unit() {
@@ -35,10 +35,14 @@ unit() {
 real() {
 	tag=${1:-29-dind}
 	echo "== Tests against a real Docker, in docker:$tag"
-	docker rm -f -v "$RUNNER" >/dev/null 2>&1 || true
-	trap 'docker rm -f -v "$RUNNER" >/dev/null 2>&1 || true' EXIT INT TERM
-	docker run -d --privileged --name "$RUNNER" -e DOCKER_TLS_CERTDIR= \
-		-v "$ROOT":/app:ro -w /app -e PYTHONDONTWRITEBYTECODE=1 "docker:$tag" >/dev/null
+	# Docker assigns a unique name; only the ID created by this run is ours.
+	trap 'if [ -n "$RUNNER" ]; then docker rm -f -v "$RUNNER" >/dev/null 2>&1 || true; fi' EXIT
+	trap 'exit 130' INT
+	trap 'exit 143' TERM
+	RUNNER=$(docker create --privileged -e DOCKER_TLS_CERTDIR= \
+		-v "$ROOT":/app:ro -w /app -e PYTHONDONTWRITEBYTECODE=1 "docker:$tag")
+	# Keep the ID before starting so startup failures are cleaned up too.
+	docker start "$RUNNER" >/dev/null
 	tries=0
 	until docker exec "$RUNNER" docker info >/dev/null 2>&1; do
 		tries=$((tries + 1))
